@@ -640,6 +640,52 @@ def fit_text_to_token_budget(text, token_budget):
     )
 
 
+def build_voice_ai_context(segments, voice_tags, predictions=None, user_mapping=None, samples_info=None, max_examples_per_voice=5):
+    """
+    Monta um resumo textual para a IA ajudar a resolver identidades de voz.
+    O áudio continua sendo processado localmente; a IA recebe rótulos, confiança e exemplos de texto.
+    """
+    predictions = predictions or {}
+    user_mapping = user_mapping or {}
+    sample_texts = {
+        item.get("tag"): item.get("sample_text", "").strip()
+        for item in (samples_info or [])
+        if item.get("tag") and item.get("sample_text")
+    }
+    grouped = {}
+    for segment, voice_tag in zip(segments, voice_tags):
+        entry = grouped.setdefault(voice_tag, {"count": 0, "examples": []})
+        entry["count"] += 1
+        text = str(segment.get("text", "")).strip()
+        if len(text) > 5 and len(entry["examples"]) < max_examples_per_voice:
+            start = format_timestamp(segment.get("start", 0), decimal=".")[:8]
+            entry["examples"].append(f"{start}: {text}")
+
+    lines = [
+        "### CONTEXTO ACÚSTICO PARA IDENTIFICAÇÃO COM IA",
+        "Use este bloco como evidência auxiliar. O rótulo confirmado pelo usuário vence a predição automática. Predições abaixo de confiança alta são candidatas, não fatos.",
+    ]
+    for voice_tag in sorted(grouped.keys(), key=lambda tag: int(tag.split("#")[-1]) if "#" in tag and tag.split("#")[-1].isdigit() else 999):
+        data = grouped[voice_tag]
+        confirmed = user_mapping.get(voice_tag)
+        prediction = predictions.get(voice_tag) or {}
+        lines.append(f"\n- {voice_tag}: {data['count']} segmentos")
+        if confirmed:
+            lines.append(f"  - Confirmado pelo usuário: {confirmed}")
+        if prediction.get("player"):
+            confidence = prediction.get("confidence", 0)
+            qualifier = "confiante" if prediction.get("is_confident") else "candidato fraco"
+            lines.append(f"  - Predição acústica do banco: {prediction['player']} ({confidence}% de similaridade, {qualifier})")
+        if sample_texts.get(voice_tag):
+            lines.append(f"  - Amostra representativa: {sample_texts[voice_tag]}")
+        examples = data["examples"]
+        if examples:
+            lines.append("  - Exemplos desta voz:")
+            for example in examples:
+                lines.append(f"    * {example}")
+    return "\n".join(lines).strip()
+
+
 # ==========================================
 # REPRODUÇÃO E CALIBRAÇÃO INTERATIVA DE VOZES
 # ==========================================
@@ -2641,6 +2687,14 @@ class RPGChroniclerApp:
                     if p_info.get("is_confident"):
                         user_voice_mapping[v_tag] = p_info["player"]
 
+            voice_ai_context = build_voice_ai_context(
+                segments,
+                voice_tags,
+                predictions=voice_predictions,
+                user_mapping=user_voice_mapping,
+                samples_info=samples_info,
+            )
+
             # Monta texto intermediário com [Tempo] [Voz Confirmada ou Voz Física #X]
             intermediate_lines = []
             diarized_segments = []
@@ -2663,6 +2717,7 @@ class RPGChroniclerApp:
                 "completed",
                 speakers=len(set(voice_tags)),
                 confirmed=bool(user_voice_mapping),
+                ai_context=True,
             )
 
             # Mostra prévia da diarização intermediária
@@ -2672,7 +2727,7 @@ class RPGChroniclerApp:
             self.root.after(0, _update_diar_preview)
 
             # 3. Execução da Síntese de IA (Diário, Light Novel, Webtoon, Bíblia)
-            self._run_ai_pipeline(intermediate_text, user_voice_mapping, options, run)
+            self._run_ai_pipeline(intermediate_text, user_voice_mapping, options, run, voice_ai_context=voice_ai_context)
 
         except InterruptedError as e:
             if run:
@@ -2720,10 +2775,11 @@ class RPGChroniclerApp:
         finally:
             self.root.after(0, self._finish_processing)
 
-    def _run_ai_pipeline(self, transcription_text, user_voice_mapping=None, options=None, run=None):
+    def _run_ai_pipeline(self, transcription_text, user_voice_mapping=None, options=None, run=None, voice_ai_context=""):
         """Pipeline de IA resiliente: Diarização refinada -> Diário -> Light Novel -> Webtoon -> Bíblia."""
         user_voice_mapping = user_voice_mapping or {}
         options = options or {}
+        voice_ai_context = str(voice_ai_context or "").strip()
 
         def response_text(response, stage):
             if self.cancel_event.is_set():
@@ -2759,6 +2815,8 @@ Regras de preservação:
             if user_voice_mapping:
                 mapping_lines = [f"- {v_tag} foi ouvida e confirmada pelo usuário como: {val}" for v_tag, val in user_voice_mapping.items()]
                 mapping_instruction = "\n### IDENTIFICAÇÃO DE VOZES CONFIRMADAS PELO USUÁRIO (OUVIDAS NO ÁUDIO):\n" + "\n".join(mapping_lines) + "\n"
+            if voice_ai_context:
+                mapping_instruction += "\n" + voice_ai_context + "\n"
 
             lm_url = options.get("lm_url", "http://127.0.0.1:1234/v1")
             api_key = options.get("api_key", "")
@@ -2803,6 +2861,9 @@ Parte {chunk_index} de {total_chunks}. Processe apenas esta fatia. Não invente 
 2. **Falas dos Jogadores:**
    - Use exatamente os nomes e personagens fornecidos na lista de participantes; não invente identidades.
    - Falas fora de personagem (risadas, piadas da vida real, dúvidas): **[Nome do Jogador (Off-Game)]**.
+   - Quando a linha vier como **[Voz Física #X]**, use o contexto acústico acima e o conteúdo da fala para escolher o participante mais provável.
+   - Se houver conflito entre predição automática e confirmação humana, use a confirmação humana.
+   - Se a evidência continuar fraca, mantenha **[Voz Física #X]** ou **[Voz Não Identificada]**; não force identificação.
 
 3. **Formato Obrigatório de cada Linha:**
 `[00:15] [CONTEXTO: IN-GAME|OUT-OF-GAME|AMBÍGUO] [Rótulo do Falante]: Fala corrigida com pontuação clara.`

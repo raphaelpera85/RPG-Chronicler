@@ -7,7 +7,7 @@ Aplicativo local para gravar ou carregar sessões de RPG, transcrever em portugu
 - Gravação incremental WAV mono 16 kHz, sem manter a sessão inteira na memória.
 - Importação de WAV, MP3, M4A, OGG, FLAC e AAC com conversão não destrutiva por FFmpeg.
 - Faster-Whisper com tentativa de CUDA e fallback para CPU.
-- Diarização acústica, calibração humana e perfis de voz persistentes.
+- Diarização acústica integrada à IA, calibração humana e perfis de voz persistentes.
 - LM Studio local ou APIs OpenAI-compatible.
 - Checkpoint automático por execução em `runs/`.
 - Transcrição em Markdown, JSON, SRT e VTT.
@@ -55,9 +55,10 @@ A chave não é persistida por versões novas do aplicativo. Consulte [SECURITY.
 1. Configure campanha, sessão, participantes e vocabulário.
 2. Grave ou carregue um áudio.
 3. Inicie o processamento e, se habilitado, confirme as amostras de voz.
-4. Acompanhe os checkpoints em `runs/<run-id>/`.
-5. Revise a proposta da Bíblia e clique em **Aprovar Bíblia** apenas quando estiver correta.
-6. Use **Salvar Tudo** para uma exportação Markdown agregada.
+4. A IA recebe as predições acústicas, confirmações humanas e exemplos por voz para refinar a identificação.
+5. Acompanhe os checkpoints em `runs/<run-id>/`.
+6. Revise a proposta da Bíblia e clique em **Aprovar Bíblia** apenas quando estiver correta.
+7. Use **Salvar Tudo** para uma exportação Markdown agregada.
 
 ## Checkpoints
 

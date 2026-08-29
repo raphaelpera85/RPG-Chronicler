@@ -17,6 +17,7 @@ import scipy.io.wavfile as wavfile
 import rpg_chronicler as app_module
 from rpg_chronicler import (
     AudioRecorder,
+    build_voice_ai_context,
     chunk_text_by_token_budget,
     estimate_text_tokens,
     extract_acoustic_features,
@@ -116,6 +117,26 @@ class RPGChroniclerTests(unittest.TestCase):
 
         self.assertEqual(matches[0]["label"], "[Heroi (Jogador)]")
         self.assertGreaterEqual(matches[0]["confidence"], 99)
+
+    def test_voice_ai_context_includes_predictions_confirmations_and_examples(self):
+        context = build_voice_ai_context(
+            [
+                {"start": 1.0, "end": 2.0, "text": "Eu abro a porta com cuidado."},
+                {"start": 3.0, "end": 4.0, "text": "A sala está escura e fria."},
+            ],
+            ["Voz Física #1", "Voz Física #2"],
+            predictions={
+                "Voz Física #1": {"player": "[Heroi (Jogador)]", "confidence": 88, "is_confident": True},
+                "Voz Física #2": {"player": "[Mestre Mesa - Narração de Cenários/NPCs]", "confidence": 73, "is_confident": False},
+            },
+            user_mapping={"Voz Física #1": "[Heroi (Jogador)]"},
+            samples_info=[{"tag": "Voz Física #2", "sample_text": "A sala está escura e fria."}],
+        )
+
+        self.assertIn("Confirmado pelo usuário: [Heroi (Jogador)]", context)
+        self.assertIn("Predição acústica do banco: [Mestre Mesa - Narração de Cenários/NPCs] (73%", context)
+        self.assertIn("Amostra representativa: A sala está escura e fria.", context)
+        self.assertIn("Eu abro a porta com cuidado.", context)
 
     def test_text_chunking_respects_token_budget(self):
         text = "\n".join(f"[00:{idx:02d}] fala longa de teste para o modelo local" for idx in range(80))
