@@ -17,8 +17,11 @@ import scipy.io.wavfile as wavfile
 import rpg_chronicler as app_module
 from rpg_chronicler import (
     AudioRecorder,
+    chunk_text_by_token_budget,
+    estimate_text_tokens,
     extract_acoustic_features,
     extract_cluster_audio_samples,
+    fit_text_to_token_budget,
     identify_voice_sample,
     match_voice_clusters_to_profiles,
     perform_acoustic_diarization,
@@ -113,6 +116,23 @@ class RPGChroniclerTests(unittest.TestCase):
 
         self.assertEqual(matches[0]["label"], "[Heroi (Jogador)]")
         self.assertGreaterEqual(matches[0]["confidence"], 99)
+
+    def test_text_chunking_respects_token_budget(self):
+        text = "\n".join(f"[00:{idx:02d}] fala longa de teste para o modelo local" for idx in range(80))
+        chunks = chunk_text_by_token_budget(text, 256)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("\n".join(chunks), text)
+        self.assertTrue(all(estimate_text_tokens(chunk) <= 256 for chunk in chunks))
+
+    def test_fit_text_to_token_budget_preserves_head_and_tail(self):
+        text = "A" * 3000 + "\nMEIO\n" + "Z" * 3000
+        fitted = fit_text_to_token_budget(text, 600)
+
+        self.assertLessEqual(estimate_text_tokens(fitted), 650)
+        self.assertTrue(fitted.startswith("A"))
+        self.assertTrue(fitted.endswith("Z"))
+        self.assertIn("omitido", fitted)
 
     def test_audio_recorder_flushes_writer_before_return(self):
         class FakeStream:

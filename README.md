@@ -11,6 +11,7 @@ Aplicativo local para gravar ou carregar sessões de RPG, transcrever em portugu
 - LM Studio local ou APIs OpenAI-compatible.
 - Checkpoint automático por execução em `runs/`.
 - Transcrição em Markdown, JSON, SRT e VTT.
+- Fatiamento automático da transcrição para modelos locais com janela curta, incluindo LM Studio em 8192 tokens.
 - Cancelamento e bloqueio contra execuções concorrentes.
 - Bíblia gerada como proposta: só substitui o canon após aprovação, mantendo backup.
 
@@ -80,6 +81,10 @@ O Hermes possui um proxy local oficial que faz o login OAuth no navegador e enca
 Esse fluxo usa o proxy local documentado pelo Hermes; não copie `auth.json`, refresh tokens ou cookies para este projeto.
 
 Para ativar a diarização neural, instale o extra `requirements-ml.txt`, aceite o modelo no Hugging Face e defina `HF_TOKEN` antes de iniciar. O aplicativo usará automaticamente `pyannote/speaker-diarization-community-1` e continuará com o diarizador acústico se o extra não estiver disponível.
+
+### Modelos locais com 8192 tokens
+
+Na aba **LM Studio & Timbre**, mantenha **Janela de contexto** em `8192` para modelos locais comuns. O RPG Chronicler divide automaticamente transcrições longas em fatias menores, refina cada fatia separadamente e cria um `session-digest.md` compacto antes de gerar diário, light novel, webtoon e proposta de Bíblia. Se o modelo local ainda reclamar de contexto, reduza esse valor para `4096` ou `6144`.
 
 ## Testes
 
