@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+.venv-*/
+dist/
+build/
+*.egg-info/
+
+# Segredos e configuração local
+.env
+rpg_chronicler_config.json
+
+# Dados privados/biométricos e resultados de campanha
+gravacoes_sessoes/
+temp_snippets/
+transcricoes_sessoes/
+runs/
+backups/
+perfis_vozes.json
+biblia_personagens_e_cenarios.md
+
+# Arquivos temporários de ferramentas
+*.log
+*.tmp
+

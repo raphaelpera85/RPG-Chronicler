@@ -1,0 +1,2 @@
+# Extra para diarização neural local (Community-1)
+pyannote.audio>=4,<5
