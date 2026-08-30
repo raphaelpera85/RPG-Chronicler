@@ -4,6 +4,7 @@
   "whisper_model_size": "small",
   "num_falantes_estimados": 4,
   "confirm_voices_interactively": true,
+  "learn_voice_profiles_from_sessions": true,
   "ai_context_tokens": 8192,
   "sample_rate": 16000,
   "campanha": "Minha Campanha",

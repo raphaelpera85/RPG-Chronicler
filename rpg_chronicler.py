@@ -34,6 +34,7 @@ import numpy as np
 import scipy.io.wavfile as wavfile
 import scipy.signal as signal
 from scipy.fftpack import dct
+from scipy.optimize import linear_sum_assignment
 import sounddevice as sd
 import requests
 from openai import OpenAI
@@ -58,6 +59,14 @@ from rpg_chronicler_core import (
     model_catalog_sort_key,
     normalize_openai_base_url,
     prepare_audio,
+    apply_highpass_filter,
+    apply_spectral_noise_suppression,
+    apply_speech_vocal_enhancer,
+    apply_dynamic_gain_control,
+    apply_transient_suppression,
+    apply_dereverberation,
+    enhance_audio_pipeline,
+    clean_and_enhance_audio_file,
 )
 
 # Diretórios
@@ -89,6 +98,11 @@ DEFAULT_CONFIG = {
     "whisper_model_size": "small",
     "num_falantes_estimados": 7,
     "confirm_voices_interactively": True,
+    "learn_voice_profiles_from_sessions": True,
+    "enable_noise_suppression": True,
+    "enable_audio_enhancer": True,
+    "enable_dynamic_agc": True,
+    "enable_conference_mode": True,
     "ai_context_tokens": 8192,
     "sample_rate": 16000,
     "campanha": "Minha campanha de RPG",
@@ -335,88 +349,248 @@ def get_installed_auth_credentials():
 
 
 # ==========================================
-# BANCO DE IMPRESSÕES DIGITAIS DE VOZ (FEW-SHOT LEARNING)
+# BANCO DE IMPRESSÕES DIGITAIS DE VOZ (FEW-SHOT LEARNING & SOTA MATCHING)
 # ==========================================
+def is_valid_voice_embedding(embedding):
+    """Verifica se o vetor de características é válido, numérico, finito e não-nulo."""
+    if embedding is None:
+        return False
+    try:
+        arr = np.array(embedding, dtype=np.float32)
+        if arr.ndim != 1 or len(arr) == 0:
+            return False
+        if not np.isfinite(arr).all():
+            return False
+        if float(np.linalg.norm(arr)) < 1e-4 or float(np.std(arr)) < 1e-4:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def clean_voice_profiles(profiles):
+    """Higieniza o dicionário de perfis removendo registros nulos ou corrompidos."""
+    if not isinstance(profiles, dict):
+        return {}
+    cleaned = {}
+    for label, data in profiles.items():
+        if not isinstance(data, dict):
+            continue
+        emb = data.get("embedding")
+        if is_valid_voice_embedding(emb):
+            cleaned[label] = data
+    return cleaned
+
+
 def load_voice_profiles():
-    """Carrega o banco permanente de impressões digitais de voz salvas."""
+    """Carrega o banco permanente de impressões digitais de voz salvas, higienizando dados inválidos."""
     if VOICE_PROFILES_FILE.exists():
         try:
             with open(VOICE_PROFILES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                raw = json.load(f)
+                cleaned = clean_voice_profiles(raw)
+                if len(cleaned) < len(raw):
+                    save_voice_profiles(cleaned)
+                return cleaned
         except Exception as e:
-            print(f"[Perfis] Erro ao carregar perfis de voz: {e}")
+            LOGGER.warning("[Perfis] Erro ao carregar perfis de voz: %s", e)
     return {}
 
 
 def save_voice_profiles(profiles):
-    """Salva o banco de impressões digitais de voz."""
+    """Salva o banco de impressões digitais de voz garantindo apenas entradas válidas."""
     try:
-        atomic_write_json(VOICE_PROFILES_FILE, profiles)
+        cleaned = clean_voice_profiles(profiles)
+        atomic_write_json(VOICE_PROFILES_FILE, cleaned)
     except Exception as e:
         LOGGER.exception("Erro ao salvar perfis de voz: %s", e)
 
 
+def delete_voice_profile(player_label):
+    """Remove um perfil específico do banco de vozes."""
+    profiles = load_voice_profiles()
+    if player_label in profiles:
+        del profiles[player_label]
+        save_voice_profiles(profiles)
+        return True
+    return False
+
+
 def normalized_voice_similarity(v1, v2):
-    """Calcula similaridade de Pearson z-score entre dois vetores de timbre de voz."""
+    """Calcula similaridade normalizada baseada em Pearson z-score e distância de cosseno."""
     v1 = np.array(v1, dtype=np.float32)
     v2 = np.array(v2, dtype=np.float32)
-    std1 = np.std(v1)
-    std2 = np.std(v2)
+    if len(v1) != len(v2):
+        return 0.0
+    std1 = float(np.std(v1))
+    std2 = float(np.std(v2))
     if std1 < 1e-5 or std2 < 1e-5:
         return 0.0
     z1 = (v1 - np.mean(v1)) / std1
     z2 = (v2 - np.mean(v2)) / std2
-    # Correlação de Pearson (-1 a 1) mapeada para 0.0 a 1.0
+    # Correlação de Pearson (-1 a 1) mapeada para [0.0, 1.0]
     r = float(np.dot(z1, z2) / len(z1))
     return max(0.0, min(1.0, (r + 1.0) / 2.0))
 
 
+def calculate_voice_profiles_separability(profiles=None):
+    """
+    Avalia a separabilidade e saúde do banco de vozes.
+    Computa a matriz de similaridade inter-jogadores e aponta possíveis ambiguidades.
+    """
+    profiles = profiles if profiles is not None else load_voice_profiles()
+    labels = list(profiles.keys())
+    n = len(labels)
+    if n < 2:
+        return {
+            "total_profiles": n,
+            "separability_score": 100 if n == 1 else 0,
+            "conflicts": [],
+            "matrix": {},
+            "status": "Poucos perfis para calcular separabilidade inter-falantes." if n < 2 else "OK"
+        }
+
+    matrix = {}
+    conflicts = []
+    min_dist = 1.0
+    max_sim = 0.0
+
+    for i in range(n):
+        l1 = labels[i]
+        matrix[l1] = {}
+        e1 = profiles[l1].get("embedding", [])
+        for j in range(n):
+            l2 = labels[j]
+            if i == j:
+                matrix[l1][l2] = 1.0
+                continue
+            e2 = profiles[l2].get("embedding", [])
+            sim = normalized_voice_similarity(e1, e2)
+            matrix[l1][l2] = round(sim, 3)
+            if j > i:
+                dist = 1.0 - sim
+                if sim > max_sim:
+                    max_sim = sim
+                if dist < min_dist:
+                    min_dist = dist
+                if sim >= 0.88:
+                    conflicts.append({
+                        "profile_a": l1,
+                        "profile_b": l2,
+                        "similarity": round(sim, 3),
+                        "warning": "Vozes muito próximas no espaço acústico. Recalibre com mais frases."
+                    })
+
+    separability_score = max(0, min(100, int((1.0 - max_sim) * 100 * 2)))
+    return {
+        "total_profiles": n,
+        "separability_score": separability_score,
+        "max_similarity": round(max_sim, 3),
+        "conflicts": conflicts,
+        "matrix": matrix,
+        "status": "Excelente" if max_sim < 0.75 else ("Boa" if max_sim < 0.85 else "Alerta: Timbre semelhante detectado")
+    }
+
+
 def match_voice_clusters_to_profiles(cluster_centroids, profiles, threshold=0.72):
     """
-    Compara os centroides acústicos das vozes detectadas com os perfis salvos.
-    Evita que uma única pessoa receba todos os clusters por engano.
+    Compara os centroides acústicos das vozes detectadas com os perfis salvos
+    utilizando Atribuição Linear Ótima Global (Algoritmo Húngaro).
+    Garante máxima acurácia global sem atribuições duplicadas conflitantes.
     """
     predictions = {}
     if not profiles or not cluster_centroids:
         return predictions
 
-    used_players = set()
+    # Lista ordenada de clusters por quantidade de falas (mais representativos)
+    sorted_clusters = sorted(
+        cluster_centroids.items(),
+        key=lambda it: it[1].get("count", 0),
+        reverse=True
+    )
+    cluster_tags = [item[0] for item in sorted_clusters]
+    cluster_feats = [item[1].get("mean_feature", []) for item in sorted_clusters]
     
-    # Ordena clusters por quantidade de falas (mais representativos primeiro)
-    sorted_items = sorted(cluster_centroids.items(), key=lambda it: it[1].get("count", 0), reverse=True)
+    player_names = list(profiles.keys())
+    player_feats = [profiles[p].get("embedding", []) for p in player_names]
 
-    for v_tag, data in sorted_items:
-        feat = data["mean_feature"]
-        best_match = None
-        best_sim = -1.0
-        best_score = -1.0
+    n_clusters = len(cluster_tags)
+    n_players = len(player_names)
 
-        for player_name, p_data in profiles.items():
-            p_feat = p_data.get("embedding", [])
-            if len(p_feat) == len(feat):
-                sim = normalized_voice_similarity(feat, p_feat)
-                # Penaliza se o jogador já foi associado a outro cluster nesta sessão
-                score = sim * (0.88 if player_name in used_players else 1.0)
-                if score > best_score:
-                    best_score = score
-                    best_sim = sim
-                    best_match = player_name
+    if n_clusters == 0 or n_players == 0:
+        return predictions
 
-        if best_match and best_sim >= threshold:
+    # Matriz de similaridade [clusters x players]
+    sim_matrix = np.zeros((n_clusters, n_players), dtype=np.float32)
+    for i, c_feat in enumerate(cluster_feats):
+        for j, p_feat in enumerate(player_feats):
+            if len(c_feat) == len(p_feat) and is_valid_voice_embedding(p_feat):
+                sim_matrix[i, j] = normalized_voice_similarity(c_feat, p_feat)
+            else:
+                sim_matrix[i, j] = 0.0
+
+    # Atribuição Linear Ótima Global (Minimizar Custo = 1.0 - Similaridade)
+    cost_matrix = 1.0 - sim_matrix
+    try:
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        assigned_clusters = set()
+        assigned_players = set()
+
+        for r, c in zip(row_ind, col_ind):
+            v_tag = cluster_tags[r]
+            player = player_names[c]
+            sim = float(sim_matrix[r, c])
+            assigned_clusters.add(r)
+            assigned_players.add(c)
+
             predictions[v_tag] = {
-                "player": best_match,
-                "similarity": round(best_sim, 3),
-                "confidence": int(max(0, min(100, best_sim * 100))),
-                "is_confident": best_sim >= 0.84
+                "player": player,
+                "similarity": round(sim, 3),
+                "confidence": int(max(0, min(100, sim * 100))),
+                "is_confident": sim >= 0.84 and sim >= threshold
             }
-            used_players.add(best_match)
-        elif best_match:
-            predictions[v_tag] = {
-                "player": best_match,
-                "similarity": round(best_sim, 3),
-                "confidence": int(max(0, min(100, best_sim * 100))),
-                "is_confident": False
-            }
+
+        # Trata clusters excedentes (quando n_clusters > n_players)
+        for i in range(n_clusters):
+            if i not in assigned_clusters:
+                v_tag = cluster_tags[i]
+                # Pega a melhor similaridade disponível (mesmo com penalidade)
+                best_p_idx = int(np.argmax(sim_matrix[i, :])) if n_players > 0 else -1
+                if best_p_idx >= 0:
+                    sim = float(sim_matrix[i, best_p_idx]) * 0.85
+                    player = player_names[best_p_idx]
+                    predictions[v_tag] = {
+                        "player": player,
+                        "similarity": round(sim, 3),
+                        "confidence": int(max(0, min(100, sim * 100))),
+                        "is_confident": False
+                    }
+    except Exception as exc:
+        LOGGER.warning("[Matching] Fallback para casamento guloso por: %s", exc)
+        # Fallback guloso robusto
+        used_players = set()
+        for v_tag, data in sorted_clusters:
+            feat = data.get("mean_feature", [])
+            best_match = None
+            best_sim = -1.0
+            best_score = -1.0
+            for player_name, p_data in profiles.items():
+                p_feat = p_data.get("embedding", [])
+                if len(p_feat) == len(feat):
+                    sim = normalized_voice_similarity(feat, p_feat)
+                    score = sim * (0.88 if player_name in used_players else 1.0)
+                    if score > best_score:
+                        best_score = score
+                        best_sim = sim
+                        best_match = player_name
+            if best_match:
+                predictions[v_tag] = {
+                    "player": best_match,
+                    "similarity": round(best_sim, 3),
+                    "confidence": int(max(0, min(100, best_sim * 100))),
+                    "is_confident": best_sim >= 0.84 if best_sim >= threshold else False
+                }
+                used_players.add(best_match)
 
     return predictions
 
@@ -440,14 +614,17 @@ def update_voice_profiles(user_confirmed_mapping, cluster_centroids):
             continue
 
         cur_feat = np.array(c_data["mean_feature"], dtype=np.float32)
-        cur_count = min(15, int(c_data["count"]))  # Limita peso por sessão para manter equilíbrio
+        if not is_valid_voice_embedding(cur_feat):
+            continue
+
+        cur_count = min(15, int(c_data.get("count", 1)))  # Limita peso por sessão para manter equilíbrio
 
         if player_label in profiles:
             old_data = profiles[player_label]
             old_feat = np.array(old_data.get("embedding", []), dtype=np.float32)
             old_count = min(30, int(old_data.get("sample_count", 1)))  # Teto de acumulação
 
-            if len(old_feat) == len(cur_feat):
+            if len(old_feat) == len(cur_feat) and is_valid_voice_embedding(old_feat):
                 total_count = old_count + cur_count
                 new_feat = (old_feat * old_count + cur_feat * cur_count) / max(1, total_count)
                 profiles[player_label]["embedding"] = new_feat.tolist()
@@ -1019,9 +1196,21 @@ class VoiceCalibrationDialog(tk.Toplevel):
 # GRAVADOR DE ÁUDIO
 # ==========================================
 class AudioRecorder:
-    def __init__(self, sample_rate=16000, channels=1):
+    def __init__(
+        self,
+        sample_rate=16000,
+        channels=1,
+        enable_denoise=True,
+        enable_enhance=True,
+        enable_agc=True,
+        enable_conference_mode=True,
+    ):
         self.sample_rate = sample_rate
         self.channels = channels
+        self.enable_denoise = enable_denoise
+        self.enable_enhance = enable_enhance
+        self.enable_agc = enable_agc
+        self.enable_conference_mode = enable_conference_mode
         self.is_recording = False
         self.is_paused = False
         self.audio_queue = queue.Queue()
@@ -1124,6 +1313,19 @@ class AudioRecorder:
                 self.current_filename.unlink(missing_ok=True)
             raise RuntimeError(f"Falha ao gravar o áudio: {error}") from error
         if self.frames_written > 0:
+            if self.enable_denoise or self.enable_enhance or self.enable_conference_mode:
+                try:
+                    clean_and_enhance_audio_file(
+                        self.current_filename,
+                        self.current_filename,
+                        sample_rate=self.sample_rate,
+                        enable_denoise=self.enable_denoise,
+                        enable_enhance=self.enable_enhance,
+                        enable_agc=self.enable_agc,
+                        enable_conference_mode=self.enable_conference_mode,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Não foi possível pós-processar áudio da gravação: %s", exc)
             return self.current_filename
         if self.current_filename:
             self.current_filename.unlink(missing_ok=True)
@@ -1199,6 +1401,14 @@ class RPGChroniclerApp:
                 self.config["sessao"] = self.sessao_entry.get().strip()
             if hasattr(self, 'confirm_voices_var'):
                 self.config["confirm_voices_interactively"] = self.confirm_voices_var.get()
+            if hasattr(self, 'learn_session_voices_var'):
+                self.config["learn_voice_profiles_from_sessions"] = self.learn_session_voices_var.get()
+            if hasattr(self, 'noise_suppression_var'):
+                self.config["enable_noise_suppression"] = self.noise_suppression_var.get()
+            if hasattr(self, 'audio_enhancer_var'):
+                self.config["enable_audio_enhancer"] = self.audio_enhancer_var.get()
+            if hasattr(self, 'conference_mode_var'):
+                self.config["enable_conference_mode"] = self.conference_mode_var.get()
             if hasattr(self, 'speakers_spin'):
                 try:
                     self.config["num_falantes_estimados"] = int(self.speakers_spin.get())
@@ -1423,9 +1633,61 @@ class RPGChroniclerApp:
         self.btn_transcribe_now = tk.Button(btn_frame, text="⚡ PROCESSAR ÁUDIO & IDENTIFICAR VOZES", font=("Segoe UI", 11, "bold"), bg=self.colors["emerald"], fg="#ffffff", padx=20, pady=10, relief="flat", cursor="hand2", command=self.start_full_processing)
         self.btn_transcribe_now.grid(row=0, column=2, padx=10)
 
-        f_load = tk.Frame(rec_card, bg=self.colors["card_bg"])
-        f_load.pack(pady=(15, 0))
-        tk.Button(f_load, text="📁 Ou Carregar Gravação Existente (WAV / MP3 / M4A)", font=("Segoe UI", 9), bg=self.colors["entry_bg"], fg=self.colors["text_muted"], relief="flat", cursor="hand2", command=self.load_audio_file).pack()
+        # Opções de Processamento e Tratamento de Áudio
+        dsp_frame = tk.Frame(rec_card, bg=self.colors["card_bg"])
+        dsp_frame.pack(fill="x", pady=(10, 0))
+
+        self.noise_suppression_var = tk.BooleanVar(value=self.config.get("enable_noise_suppression", True))
+        self.audio_enhancer_var = tk.BooleanVar(value=self.config.get("enable_audio_enhancer", True))
+        self.conference_mode_var = tk.BooleanVar(value=self.config.get("enable_conference_mode", True))
+
+        chk_denoise = tk.Checkbutton(
+            dsp_frame,
+            text="🧹 Supressor de Ruído (Filtro 80Hz + Anti-Chiado)",
+            variable=self.noise_suppression_var,
+            onvalue=True, offvalue=False,
+            font=("Segoe UI", 9, "bold"),
+            fg=self.colors["emerald"],
+            bg=self.colors["card_bg"],
+            activebackground=self.colors["card_bg"],
+            activeforeground=self.colors["emerald"],
+            selectcolor=self.colors["entry_bg"],
+            cursor="hand2",
+            command=self.save_config
+        )
+        chk_denoise.pack(side="left", padx=(0, 10))
+
+        chk_enhance = tk.Checkbutton(
+            dsp_frame,
+            text="🎙️ Realce Vocal & AGC",
+            variable=self.audio_enhancer_var,
+            onvalue=True, offvalue=False,
+            font=("Segoe UI", 9, "bold"),
+            fg=self.colors["accent_bright"],
+            bg=self.colors["card_bg"],
+            activebackground=self.colors["card_bg"],
+            activeforeground=self.colors["accent_bright"],
+            selectcolor=self.colors["entry_bg"],
+            cursor="hand2",
+            command=self.save_config
+        )
+        chk_enhance.pack(side="left", padx=(0, 10))
+
+        chk_conf = tk.Checkbutton(
+            dsp_frame,
+            text="🏢 Modo Sala Grande & Microfone de Conferência (7 Pessoas / Distância + Eco + Anti-Dados)",
+            variable=self.conference_mode_var,
+            onvalue=True, offvalue=False,
+            font=("Segoe UI", 9, "bold"),
+            fg=self.colors["gold"],
+            bg=self.colors["card_bg"],
+            activebackground=self.colors["card_bg"],
+            activeforeground=self.colors["gold"],
+            selectcolor=self.colors["entry_bg"],
+            cursor="hand2",
+            command=self.save_config
+        )
+        chk_conf.pack(side="left")
 
         self.confirm_voices_var = tk.BooleanVar(value=self.config.get("confirm_voices_interactively", True))
         chk_calib = tk.Checkbutton(
@@ -1448,6 +1710,9 @@ class RPGChroniclerApp:
         if not self.recorder.is_recording:
             dev_str = self.dev_combo.get()
             dev_idx = int(dev_str.split(":")[0]) if ":" in dev_str else None
+            self.recorder.enable_denoise = bool(self.noise_suppression_var.get()) if hasattr(self, "noise_suppression_var") else True
+            self.recorder.enable_enhance = bool(self.audio_enhancer_var.get()) if hasattr(self, "audio_enhancer_var") else True
+            self.recorder.enable_conference_mode = bool(self.conference_mode_var.get()) if hasattr(self, "conference_mode_var") else True
             self.recorder.start(device_idx=dev_idx)
             self.btn_record.config(text="⏹️ PARAR GRAVAÇÃO", bg="#9b2226")
             self.btn_pause.config(state="normal", text="⏸️ PAUSAR", bg="#30363d")
@@ -1771,10 +2036,94 @@ class RPGChroniclerApp:
         self.voice_profiles_tree.column("atualizado", width=180)
         self.voice_profiles_tree.pack(fill="x")
 
+        f_bank_actions = tk.Frame(bank_card, bg=self.colors["card_bg"])
+        f_bank_actions.pack(fill="x", pady=(8, 2))
+
+        self.btn_diagnose_voices = tk.Button(
+            f_bank_actions,
+            text="🩺 Diagnosticar Separabilidade & Saúde",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.colors["accent"],
+            fg="#ffffff",
+            relief="flat",
+            cursor="hand2",
+            padx=10,
+            pady=4,
+            command=self.diagnose_voice_health,
+        )
+        self.btn_diagnose_voices.pack(side="left", padx=(0, 8))
+
+        self.btn_delete_voice = tk.Button(
+            f_bank_actions,
+            text="🗑️ Excluir Perfil Selecionado",
+            font=("Segoe UI", 9, "bold"),
+            bg="#b91c1c",
+            fg="#ffffff",
+            relief="flat",
+            cursor="hand2",
+            padx=10,
+            pady=4,
+            command=self.delete_selected_voice_profile,
+        )
+        self.btn_delete_voice.pack(side="left", padx=(0, 8))
+
         self.training_audio_file = None
         self.identification_audio_file = None
         self.refresh_training_voice_options()
         self.refresh_voice_profiles_tree()
+
+    def diagnose_voice_health(self):
+        """Executa diagnóstico de separabilidade e exibe na caixa de texto."""
+        profiles = load_voice_profiles()
+        report = calculate_voice_profiles_separability(profiles)
+        self.txt_voice_identification.delete("1.0", "end")
+        
+        lines = [
+            "==================================================",
+            "📊 RELATÓRIO DE SAÚDE & SEPARABILIDADE VOCAL",
+            "==================================================",
+            f"• Perfis válidos cadastrados: {report['total_profiles']}",
+            f"• Índice de Separabilidade: {report['separability_score']}/100 ({report['status']})",
+        ]
+        if "max_similarity" in report:
+            lines.append(f"• Maior similaridade entre duas pessoas: {report['max_similarity'] * 100:.1f}%")
+        
+        if report.get("conflicts"):
+            lines.append("\n⚠️ ALERTAS DE POSSÍVEL CONFUSÃO DE TIMBRE:")
+            for c in report["conflicts"]:
+                lines.append(f"  - {c['profile_a']} <---> {c['profile_b']}: {c['similarity'] * 100:.1f}% igual")
+                lines.append(f"    Sugestão: {c['warning']}")
+        else:
+            lines.append("\n✅ Nenhuma sobreposição crítica encontrada. As vozes possuem boa distinção.")
+
+        if report.get("matrix"):
+            lines.append("\n📐 Matriz de Similaridade Inter-Falantes:")
+            for p1, row in report["matrix"].items():
+                short_p1 = (p1[:22] + "..") if len(p1) > 24 else p1
+                row_str = " | ".join(f"{p2[:12]}: {sim*100:.0f}%" for p2, sim in row.items() if p1 != p2)
+                lines.append(f"  {short_p1:24} -> {row_str}")
+
+        lines.append("\n💡 Dica: Para melhorar a separação, use as frases de material_treino_vozes_30x21.md.")
+        self.txt_voice_identification.insert("1.0", "\n".join(lines) + "\n")
+
+    def delete_selected_voice_profile(self):
+        """Exclui o perfil selecionado na árvore de perfis."""
+        selected = self.voice_profiles_tree.selection()
+        if not selected:
+            messagebox.showwarning("Excluir Perfil", "Selecione um perfil na tabela para excluir.")
+            return
+        values = self.voice_profiles_tree.item(selected[0], "values")
+        if not values:
+            return
+        label = values[0]
+        if messagebox.askyesno("Confirmar Exclusão", f"Deseja excluir a impressão acústica de:\n\n{label}?"):
+            if delete_voice_profile(label):
+                self.refresh_voice_profiles_tree()
+                self.refresh_training_voice_options()
+                self.update_bank_status_label()
+                messagebox.showinfo("Perfil Excluído", f"Perfil '{label}' removido com sucesso.")
+            else:
+                messagebox.showerror("Erro", f"Não foi possível encontrar o perfil '{label}'.")
 
     def refresh_training_voice_options(self):
         options = participant_voice_options(self.config.get("participantes", []))
@@ -2042,12 +2391,31 @@ class RPGChroniclerApp:
         f_spk = tk.Frame(card_acoustics, bg=self.colors["card_bg"])
         f_spk.pack(fill="x", pady=4)
         tk.Label(f_spk, text="Quantidade de Vozes na Mesa:", font=("Segoe UI", 9, "bold"), fg=self.colors["text"], bg=self.colors["card_bg"]).pack(side="left")
-        self.speakers_spin = tk.Spinbox(f_spk, from_=2, to=10, width=5, bg=self.colors["entry_bg"], fg="#ffffff", insertbackground="#ffffff", buttonbackground=self.colors["card_border"], relief="solid", bd=1, font=("Segoe UI", 10, "bold"))
+        self.speakers_spin = tk.Spinbox(f_spk, from_=1, to=30, width=5, bg=self.colors["entry_bg"], fg="#ffffff", insertbackground="#ffffff", buttonbackground=self.colors["card_border"], relief="solid", bd=1, font=("Segoe UI", 10, "bold"), command=self.save_config)
         self.speakers_spin.delete(0, "end")
-        self.speakers_spin.insert(0, str(len(self.config.get("participantes", [1,2,3,4]))))
+        self.speakers_spin.insert(0, str(int(self.config.get("num_falantes_estimados", len(self.config.get("participantes", [1,2,3,4]))))))
         self.speakers_spin.pack(side="left", padx=10)
+        self.speakers_spin.bind("<FocusOut>", lambda _event: self.save_config())
+        self.speakers_spin.bind("<Return>", lambda _event: self.save_config())
 
-        tk.Label(f_spk, text="(O algoritmo agrupa as ondas de som por timbre espectral MFCC e cruza com a IA)", font=("Segoe UI", 8), fg=self.colors["text_muted"], bg=self.colors["card_bg"]).pack(side="left")
+        tk.Label(f_spk, text="(Esse número controla reconhecimento, amostras e aprendizado da gravação)", font=("Segoe UI", 8), fg=self.colors["text_muted"], bg=self.colors["card_bg"]).pack(side="left")
+
+        self.learn_session_voices_var = tk.BooleanVar(value=self.config.get("learn_voice_profiles_from_sessions", True))
+        chk_learn = tk.Checkbutton(
+            card_acoustics,
+            text="Aprender/reforçar perfis de voz a partir da gravação da sessão",
+            variable=self.learn_session_voices_var,
+            onvalue=True, offvalue=False,
+            font=("Segoe UI", 10, "bold"),
+            fg=self.colors["gold"],
+            bg=self.colors["card_bg"],
+            activebackground=self.colors["card_bg"],
+            activeforeground=self.colors["gold"],
+            selectcolor=self.colors["entry_bg"],
+            cursor="hand2",
+            command=self.save_config,
+        )
+        chk_learn.pack(anchor="w", pady=(10, 0))
 
     def apply_openai_codex_preset(self):
         self.lm_url_entry.delete(0, "end")
@@ -2386,6 +2754,10 @@ class RPGChroniclerApp:
             "whisper_model_size": self.config.get("whisper_model_size", "small"),
             "estimated_speakers": speakers,
             "confirm_voices": bool(self.confirm_voices_var.get()),
+            "learn_voice_profiles": bool(self.learn_session_voices_var.get()) if hasattr(self, "learn_session_voices_var") else True,
+            "enable_noise_suppression": bool(self.noise_suppression_var.get()) if hasattr(self, "noise_suppression_var") else True,
+            "enable_audio_enhancer": bool(self.audio_enhancer_var.get()) if hasattr(self, "audio_enhancer_var") else True,
+            "enable_conference_mode": bool(self.conference_mode_var.get()) if hasattr(self, "conference_mode_var") else True,
             "participants": list(self.config.get("participantes", [])),
             "terms": self.termos_text.get("1.0", "end").strip(),
             "campaign": self.campanha_entry.get().strip(),
@@ -2513,7 +2885,33 @@ class RPGChroniclerApp:
             }
             run = SessionRun.create(RUNS_DIR, prepared_audio.metadata, manifest_config)
             self.current_run = run
-            audio_path = str(prepared_audio.processing_path)
+
+            # Pré-processamento de Áudio: Supressor de Ruídos, Desreverberação de Sala & Melhorador Vocal
+            need_dsp = (
+                options.get("enable_noise_suppression", True)
+                or options.get("enable_audio_enhancer", True)
+                or options.get("enable_conference_mode", True)
+            )
+            if need_dsp:
+                status_msg = "🧹 Tratando Áudio (Conferência 7 Pessoas: Desreverberação + Nivelamento + Anti-Ruído)..." if options.get("enable_conference_mode") else "🧹 Tratando Áudio (Supressão de Ruído & Realce Vocal)..."
+                self.update_ui_progress(1, status_msg, "Otimizando frequências vocais e compensando distância de microfone...", color=self.colors["emerald"])
+                try:
+                    cleaned_audio_path = clean_and_enhance_audio_file(
+                        prepared_audio.processing_path,
+                        sample_rate=options["sample_rate"],
+                        enable_denoise=options.get("enable_noise_suppression", True),
+                        enable_enhance=options.get("enable_audio_enhancer", True),
+                        enable_agc=True,
+                        enable_conference_mode=options.get("enable_conference_mode", True),
+                    )
+                    audio_path = str(cleaned_audio_path)
+                    print(f"[DSP] Áudio de conferência tratado e otimizado: {audio_path}")
+                except Exception as exc_dsp:
+                    LOGGER.warning("[DSP] Falha ao pré-processar áudio; usando original: %s", exc_dsp)
+                    audio_path = str(prepared_audio.processing_path)
+            else:
+                audio_path = str(prepared_audio.processing_path)
+
             if prepared_audio.metadata.duration_seconds > 2 * 60 * 60:
                 self.update_ui_progress(
                     1,
@@ -2645,6 +3043,8 @@ class RPGChroniclerApp:
             samples_info = extract_cluster_audio_samples(audio_path, segments, voice_tags, predictions=voice_predictions)
             user_voice_mapping = {}
             should_ask_user = options["confirm_voices"]
+            should_learn_profiles = bool(options.get("learn_voice_profiles", True))
+            voice_profiles_updated = False
 
             if should_ask_user and samples_info:
                 self.update_ui_progress(
@@ -2669,7 +3069,7 @@ class RPGChroniclerApp:
                         options["participants"],
                         self.colors,
                         _on_calib_done,
-                        cluster_centroids=cluster_centroids
+                        cluster_centroids=cluster_centroids if should_learn_profiles else None
                     )
 
                 self.root.after(0, _open_dialog)
@@ -2679,6 +3079,7 @@ class RPGChroniclerApp:
 
                 if calib_result["confirmed"] and calib_result["mapping"]:
                     user_voice_mapping = calib_result["mapping"]
+                    voice_profiles_updated = should_learn_profiles
                     # Atualiza o indicador do banco na Aba 2
                     self.root.after(0, self.update_bank_status_label)
             elif voice_predictions:
@@ -2686,6 +3087,11 @@ class RPGChroniclerApp:
                 for v_tag, p_info in voice_predictions.items():
                     if p_info.get("is_confident"):
                         user_voice_mapping[v_tag] = p_info["player"]
+
+            if should_learn_profiles and user_voice_mapping and not voice_profiles_updated:
+                update_voice_profiles(user_voice_mapping, cluster_centroids)
+                voice_profiles_updated = True
+                self.root.after(0, self.update_bank_status_label)
 
             voice_ai_context = build_voice_ai_context(
                 segments,
@@ -2717,6 +3123,7 @@ class RPGChroniclerApp:
                 "completed",
                 speakers=len(set(voice_tags)),
                 confirmed=bool(user_voice_mapping),
+                learned=voice_profiles_updated,
                 ai_context=True,
             )
 

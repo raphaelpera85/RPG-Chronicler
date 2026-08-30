@@ -8,6 +8,7 @@ Aplicativo local para gravar ou carregar sessões de RPG, transcrever em portugu
 - Importação de WAV, MP3, M4A, OGG, FLAC e AAC com conversão não destrutiva por FFmpeg.
 - Faster-Whisper com tentativa de CUDA e fallback para CPU.
 - Diarização acústica integrada à IA, calibração humana e perfis de voz persistentes.
+- Aprendizado de perfis diretamente a partir da gravação da sessão, usando a quantidade de vozes configurada.
 - LM Studio local ou APIs OpenAI-compatible.
 - Checkpoint automático por execução em `runs/`.
 - Transcrição em Markdown, JSON, SRT e VTT.
@@ -53,12 +54,17 @@ A chave não é persistida por versões novas do aplicativo. Consulte [SECURITY.
 ## Fluxo de uso
 
 1. Configure campanha, sessão, participantes e vocabulário.
-2. Grave ou carregue um áudio.
-3. Inicie o processamento e, se habilitado, confirme as amostras de voz.
-4. A IA recebe as predições acústicas, confirmações humanas e exemplos por voz para refinar a identificação.
-5. Acompanhe os checkpoints em `runs/<run-id>/`.
-6. Revise a proposta da Bíblia e clique em **Aprovar Bíblia** apenas quando estiver correta.
-7. Use **Salvar Tudo** para uma exportação Markdown agregada.
+2. Na aba **LM Studio & Timbre**, defina **Quantidade de Vozes na Mesa**.
+3. Grave ou carregue um áudio.
+4. Inicie o processamento e, se habilitado, confirme as amostras de voz.
+5. A IA recebe as predições acústicas, confirmações humanas e exemplos por voz para refinar a identificação.
+6. Acompanhe os checkpoints em `runs/<run-id>/`.
+7. Revise a proposta da Bíblia e clique em **Aprovar Bíblia** apenas quando estiver correta.
+8. Use **Salvar Tudo** para uma exportação Markdown agregada.
+
+### Treino pela gravação da sessão
+
+Para uma sessão real, carregue a gravação, defina a quantidade de vozes esperada e deixe **Aprender/reforçar perfis de voz a partir da gravação da sessão** ligado. O Chronicler agrupa a sessão nesse número de vozes, extrai amostras, compara com `perfis_vozes.json` e atualiza o banco quando houver confirmação humana ou reconhecimento acústico confiante. Se o grupo tiver vozes novas, mantenha a confirmação interativa ligada na primeira sessão para nomear cada voz corretamente.
 
 ## Checkpoints
 
