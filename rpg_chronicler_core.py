@@ -22,8 +22,10 @@ import urllib.parse
 from urllib.parse import urlparse
 import urllib.request
 import zipfile
+import base64
 import html
 import http.server
+import ssl
 
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -2676,10 +2678,71 @@ $synth.Dispose()
 # 5. PAINEL COMPANION WEB LOCAL WI-FI (HTTP.SERVER ZERO-DEPENDENCY)
 # =====================================================================
 
+def ensure_companion_ssl_cert(cert_dir: Path | str | None = None) -> tuple[str, str]:
+    """Gera um certificado SSL autoassinado local para liberar Web Audio / getUserMedia em celulares na LAN."""
+    if cert_dir is None:
+        cert_dir = Path.home() / ".rpg_chronicler" / "ssl"
+    else:
+        cert_dir = Path(cert_dir)
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_file = cert_dir / "companion_cert.pem"
+    key_file = cert_dir / "companion_key.pem"
+    if cert_file.exists() and key_file.exists():
+        return str(cert_file), str(key_file)
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        import datetime
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "RPG Chronicler Companion"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "RPG Chronicler"),
+        ])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=730))
+            .add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(socket.inet_aton("127.0.0.1")),
+                ]),
+                critical=False,
+            )
+            .sign(key, hashes.SHA256())
+        )
+        cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        key_file.write_bytes(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+        return str(cert_file), str(key_file)
+    except Exception as exc:
+        raise RuntimeError(f"Não foi possível gerar certificado SSL local: {exc}")
+
+
 class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
     """Handler HTTP para o painel companion local via Wi-Fi."""
 
     server_ref: Any = None
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -2690,6 +2753,13 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             data = self.server_ref.get_session_data() if self.server_ref else {}
             self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        elif parsed.path == "/api/participants":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            participants = self.server_ref.get_participants() if self.server_ref else []
+            self.wfile.write(json.dumps({"participants": participants}, ensure_ascii=False).encode("utf-8"))
         elif parsed.path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2702,13 +2772,14 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8", errors="replace") if content_length > 0 else "{}"
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {}
+
         if parsed.path == "/api/highlight":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
-            try:
-                payload = json.loads(body)
-            except Exception:
-                payload = {}
             if self.server_ref:
                 hl = self.server_ref.on_remote_highlight(payload)
                 self.send_response(200)
@@ -2716,6 +2787,30 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok", "highlight": hl}, ensure_ascii=False).encode("utf-8"))
+            else:
+                self.send_response(500)
+                self.end_headers()
+        elif parsed.path == "/api/voice/train":
+            if self.server_ref:
+                res = self.server_ref.on_remote_voice_train(payload)
+                status_code = 200 if res.get("status") == "ok" else 400
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
+            else:
+                self.send_response(500)
+                self.end_headers()
+        elif parsed.path == "/api/satellite/chunk":
+            if self.server_ref:
+                res = self.server_ref.on_remote_satellite_chunk(payload)
+                status_code = 200 if res.get("status") == "ok" else 400
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
             else:
                 self.send_response(500)
                 self.end_headers()
@@ -2730,13 +2825,17 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
 class RPGCompanionWebServer:
     """Servidor web local leve (sem frameworks externos) para jogadores acompanharem a sessão no celular."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_https: bool = False):
         self.host = host
         self.port = port
+        self.use_https = use_https
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
         self.highlight_callback: Any = None
+        self.voice_train_callback: Any = None
+        self.satellite_chunk_callback: Any = None
+        self.get_participants_callback: Any = None
         self.session_data: dict = {
             "title": "Sessão Ativa",
             "status": "Gravando...",
@@ -2746,13 +2845,20 @@ class RPGCompanionWebServer:
             "summary": "Sessão em andamento.",
         }
 
-    def start(self) -> bool:
+    def start(self, use_https: bool | None = None) -> bool:
         if self.server is not None:
             return True
+        if use_https is not None:
+            self.use_https = use_https
         try:
             handler_class = RPGCompanionHTTPHandler
             handler_class.server_ref = self
             self.server = http.server.ThreadingHTTPServer((self.host, self.port), handler_class)
+            if self.use_https:
+                cert_file, key_file = ensure_companion_ssl_cert()
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+                self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
             return True
@@ -2781,12 +2887,74 @@ class RPGCompanionWebServer:
         with self.lock:
             return dict(self.session_data)
 
+    def get_participants(self) -> list[dict]:
+        if callable(self.get_participants_callback):
+            try:
+                return self.get_participants_callback() or []
+            except Exception:
+                return []
+        return []
+
     def on_remote_highlight(self, payload: dict) -> dict:
         category = payload.get("category", "epic")
         description = payload.get("description", "Marcado via Celular")
         if callable(self.highlight_callback):
             return self.highlight_callback(category, description)
         return {"category": category, "description": description}
+
+    def on_remote_voice_train(self, payload: dict) -> dict:
+        player_label = (payload.get("player_label") or payload.get("label") or "").strip()
+        audio_b64 = payload.get("audio_b64") or payload.get("audio", "")
+        if not player_label:
+            return {"status": "error", "message": "Nenhum perfil de personagem selecionado."}
+        if not audio_b64:
+            return {"status": "error", "message": "Nenhum dado de áudio foi recebido."}
+        if "," in audio_b64:
+            audio_b64 = audio_b64.split(",", 1)[1]
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+        except Exception as exc:
+            return {"status": "error", "message": f"Falha ao decodificar áudio: {exc}"}
+
+        filename = payload.get("filename") or "training.webm"
+        suffix = Path(filename).suffix or ".webm"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        try:
+            temp_file.write(audio_bytes)
+            temp_file.flush()
+            temp_file.close()
+
+            if callable(self.voice_train_callback):
+                res = self.voice_train_callback(player_label, temp_file.name)
+                return res if isinstance(res, dict) else {"status": "ok", "message": f"Perfil '{player_label}' treinado com sucesso!"}
+            return {"status": "ok", "message": "Áudio de treino recebido com sucesso."}
+        finally:
+            try:
+                if os.path.exists(temp_file.name):
+                    os.unlink(temp_file.name)
+            except Exception:
+                pass
+
+    def on_remote_satellite_chunk(self, payload: dict) -> dict:
+        player_label = (payload.get("player_label") or "").strip()
+        audio_b64 = payload.get("audio_b64") or ""
+        chunk_index = int(payload.get("chunk_index", 0))
+        timestamp = float(payload.get("timestamp", 0.0))
+        client_id = str(payload.get("client_id", "unknown"))
+
+        if not audio_b64:
+            return {"status": "error", "message": "Chunk vazio"}
+        if "," in audio_b64:
+            audio_b64 = audio_b64.split(",", 1)[1]
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+        except Exception as exc:
+            return {"status": "error", "message": f"Erro de base64: {exc}"}
+
+        if callable(self.satellite_chunk_callback):
+            res = self.satellite_chunk_callback(player_label, client_id, chunk_index, timestamp, audio_bytes)
+            return res if isinstance(res, dict) else {"status": "ok"}
+        return {"status": "ok"}
 
     @staticmethod
     def get_local_ip() -> str:
@@ -2804,25 +2972,33 @@ class RPGCompanionWebServer:
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>RPG Chronicler - Companion de Mesa</title>
     <style>
         :root {
-            --bg: #0d1117;
-            --card: #161b22;
-            --border: #30363d;
-            --text: #c9d1d9;
-            --gold: #f1c40f;
-            --accent: #58a6ff;
-            --green: #2ea043;
-            --red: #da3633;
+            --bg: #0b0f17;
+            --card: #151c28;
+            --card-hover: #1b2434;
+            --border: #233044;
+            --text: #e1e7f0;
+            --text-muted: #8899ac;
+            --gold: #f59e0b;
+            --gold-glow: #f59e0b33;
+            --accent: #38bdf8;
+            --accent-glow: #38bdf833;
+            --green: #10b981;
+            --green-glow: #10b98133;
+            --red: #ef4444;
+            --purple: #a855f7;
         }
+        * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background: var(--bg);
             color: var(--text);
             margin: 0;
-            padding: 16px;
+            padding: 14px;
+            padding-bottom: 40px;
         }
         .header {
             text-align: center;
@@ -2830,85 +3006,491 @@ class RPGCompanionWebServer:
             padding-bottom: 12px;
             margin-bottom: 16px;
         }
-        .title { color: var(--gold); font-size: 1.4rem; font-weight: bold; margin: 0; }
+        .title { color: var(--gold); font-size: 1.35rem; font-weight: 800; margin: 0; letter-spacing: 0.5px; }
+        .sub-header { display: flex; justify-content: center; gap: 8px; align-items: center; margin-top: 6px; }
         .status-badge {
-            display: inline-block;
             background: var(--green);
             color: #fff;
-            padding: 2px 8px;
+            padding: 2px 10px;
             border-radius: 12px;
-            font-size: 0.8rem;
-            margin-top: 6px;
+            font-size: 0.75rem;
+            font-weight: bold;
         }
+        .sess-duration { font-size: 0.8rem; color: var(--text-muted); }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        .card h3 { margin: 0 0 10px 0; font-size: 1.05rem; color: var(--accent); display: flex; align-items: center; gap: 6px; }
+        .form-group { margin-bottom: 8px; }
+        label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 4px; font-weight: 600; }
+        select {
+            width: 100%;
+            background: #0d131d;
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            outline: none;
+        }
+        select:focus { border-color: var(--accent); }
         .btn-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 10px;
-            margin-bottom: 20px;
+            margin-bottom: 4px;
         }
         .btn {
-            background: var(--card);
+            background: var(--card-hover);
             border: 1px solid var(--border);
             color: var(--text);
             padding: 12px;
             border-radius: 8px;
-            font-size: 1rem;
+            font-size: 0.95rem;
             font-weight: bold;
             cursor: pointer;
             text-align: center;
+            transition: all 0.15s ease;
         }
-        .btn:active { transform: scale(0.98); }
-        .btn-epic { border-color: var(--gold); color: var(--gold); }
-        .btn-crit { border-color: var(--red); color: var(--red); }
-        .card {
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 14px;
-            margin-bottom: 16px;
+        .btn:active { transform: scale(0.97); }
+        .btn-epic { border-color: var(--gold); color: var(--gold); background: var(--gold-glow); }
+        .btn-crit { border-color: var(--red); color: var(--red); background: #ef444422; }
+        .btn-primary { background: #0284c7; color: #fff; border: none; width: 100%; }
+        .btn-danger { background: var(--red); color: #fff; border: none; width: 100%; }
+        .btn-satellite-on { background: #059669; color: #fff; border: none; animation: pulse 2s infinite; }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
         }
-        .card h3 { margin-top: 0; font-size: 1.1rem; color: var(--accent); }
-        .dialogue-item { padding: 6px 0; border-bottom: 1px solid #21262d; font-size: 0.95rem; }
+        .phrase-box {
+            background: #0d131d;
+            border-left: 3px solid var(--gold);
+            padding: 10px 12px;
+            font-size: 0.88rem;
+            line-height: 1.4;
+            border-radius: 0 8px 8px 0;
+            margin: 8px 0;
+            color: #d1d5db;
+        }
+        .vu-meter {
+            height: 8px;
+            width: 100%;
+            background: #0d131d;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 8px 0;
+        }
+        .vu-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--green) 60%, var(--gold) 85%, var(--red) 100%);
+            transition: width 0.08s ease;
+        }
+        .alert-box {
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            margin-top: 8px;
+            display: none;
+        }
+        .alert-success { background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }
+        .alert-warn { background: #78350f; color: #fde68a; border: 1px solid #d97706; }
+        .dialogue-item { padding: 8px 0; border-bottom: 1px solid #1f293d; font-size: 0.9rem; line-height: 1.35; }
         .speaker { font-weight: bold; color: var(--gold); }
-        .highlight-badge { background: #388bfd33; color: var(--accent); padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; }
+        .highlight-badge { background: #38bdf822; color: var(--accent); padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+        .pill-tab {
+            display: inline-block;
+            background: #0d131d;
+            border: 1px solid var(--border);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            margin-right: 4px;
+            color: var(--text-muted);
+        }
+        .pill-tab.active { background: var(--accent); color: #000; font-weight: bold; border-color: var(--accent); }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="title" id="sess-title">⚔️ RPG Chronicler Companion</div>
-        <div class="status-badge" id="sess-status">Conectado</div>
+        <div class="sub-header">
+            <span class="status-badge" id="sess-status">Conectado</span>
+            <span class="sess-duration" id="sess-duration">00:00:00</span>
+        </div>
     </div>
+
+    <!-- SELEÇÃO DE PERSONAGEM -->
+    <div class="card">
+        <h3>🎭 Meu Personagem na Mesa</h3>
+        <div class="form-group">
+            <label for="player-select">Selecione quem você está interpretando:</label>
+            <select id="player-select" onchange="onPlayerChange()">
+                <option value="">-- Carregando participantes... --</option>
+            </select>
+        </div>
+        <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 4px;">
+            Essa escolha orienta o treino de voz e o microfone satélite no seu aparelho.
+        </div>
+    </div>
+
+    <!-- TREINO DE VOZ GUIADO -->
+    <div class="card">
+        <h3>🎙️ Treinar Voz com Leitura Rápida</h3>
+        <p style="font-size: 0.82rem; color: var(--text-muted); margin: 0 0 6px 0;">
+            Grave uma das frases abaixo (15s) para o sistema aprender seu timbre e identificá-lo automaticamente:
+        </p>
+
+        <div style="margin-bottom: 6px;">
+            <span class="pill-tab active" id="tab-p1" onclick="switchPhrase(1)">Opção 1: Ação & Furtividade</span>
+            <span class="pill-tab" id="tab-p2" onclick="switchPhrase(2)">Opção 2: Combate & D20</span>
+        </div>
+
+        <div class="phrase-box" id="phrase-text">
+            "Eu saco a minha arma e avanço com cautela pelas sombras do calabouço. Vejo uma porta de ferro enferrujada entreaberta e aviso o grupo em voz baixa: preparem suas tochas e fiquem atentos, sinto cheiro de enxofre e passos pesados logo à frente."
+        </div>
+
+        <div class="vu-meter"><div class="vu-fill" id="train-vu"></div></div>
+
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+            <button class="btn btn-primary" id="btn-train-rec" onclick="toggleTrainRecording()">🔴 Iniciar Gravação (15s)</button>
+        </div>
+        <div id="train-status" class="alert-box"></div>
+    </div>
+
+    <!-- MICROFONE SATÉLITE DA SESSÃO -->
+    <div class="card">
+        <h3>📡 Microfone Satélite da Sessão</h3>
+        <p style="font-size: 0.82rem; color: var(--text-muted); margin: 0 0 8px 0;">
+            Deixe o celular na mesa perto de você durante o jogo. Ele capta sua voz com nitidez para ajudar a separar as falas da mesa.
+        </p>
+        <div class="vu-meter"><div class="vu-fill" id="sat-vu"></div></div>
+        <button class="btn" id="btn-satellite" style="width: 100%;" onclick="toggleSatellite()">🎙️ Ativar Microfone Satélite</button>
+        <div id="sat-status" class="alert-box" style="margin-top: 8px;"></div>
+    </div>
+
+    <!-- MARCADORES RÁPIDOS -->
     <div class="btn-grid">
         <button class="btn btn-epic" onclick="sendHighlight('epic', 'Momento Épico via Mobile')">⭐ Momento Épico</button>
         <button class="btn btn-crit" onclick="sendHighlight('critical', 'Crítico / Reviravolta')">⚔️ Crítico!</button>
     </div>
-    <div class="card">
-        <h3>🎙️ Últimos Diálogos</h3>
-        <div id="dialogues">Aguardando falas...</div>
+
+    <!-- ÚLTIMOS DIÁLOGOS -->
+    <div class="card" style="margin-top: 14px;">
+        <h3>📜 Transcrição Recente</h3>
+        <div id="dialogues" style="max-height: 220px; overflow-y: auto;">Aguardando falas...</div>
     </div>
+
+    <!-- DESTAQUES -->
     <div class="card">
-        <h3>⭐ Destaques Recentes</h3>
+        <h3>⭐ Destaques da Sessão</h3>
         <div id="highlights">Nenhum destaque ainda.</div>
     </div>
+
     <script>
+        let currentPhrase = 1;
+        const PHRASES = {
+            1: "Eu saco a minha arma e avanço com cautela pelas sombras do calabouço. Vejo uma porta de ferro enferrujada entreaberta e aviso o grupo em voz baixa: preparem suas tochas e fiquem atentos, sinto cheiro de enxofre e passos pesados logo à frente.",
+            2: "Mestre, tirei 18 no d20 de iniciativa! No meu turno eu conjuro minha magia no goblin da esquerda e rolo quatro dados de dano perfurante. Alguém do grupo precisa de cura ou posso gastar minha ação bônus para desengajar?"
+        };
+
+        function switchPhrase(num) {
+            currentPhrase = num;
+            document.getElementById('phrase-text').innerText = PHRASES[num];
+            document.getElementById('tab-p1').classList.toggle('active', num === 1);
+            document.getElementById('tab-p2').classList.toggle('active', num === 2);
+        }
+
+        function onPlayerChange() {
+            const val = document.getElementById('player-select').value;
+            if (val) localStorage.setItem('rpg_selected_player', val);
+        }
+
+        async function loadParticipants() {
+            try {
+                const res = await fetch('/api/participants');
+                const data = await res.json();
+                const sel = document.getElementById('player-select');
+                sel.innerHTML = '';
+                const parts = data.participants || [];
+                if (parts.length === 0) {
+                    sel.innerHTML = '<option value="">Nenhum participante configurado no PC</option>';
+                    return;
+                }
+                const saved = localStorage.getItem('rpg_selected_player');
+                parts.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.label || p.nome || p;
+                    opt.innerText = p.label || p.nome || p;
+                    if (opt.value === saved) opt.selected = true;
+                    sel.appendChild(opt);
+                });
+            } catch (e) {
+                console.warn('Erro ao carregar participantes', e);
+            }
+        }
+
+        // ==================== GRAVAÇÃO DE TREINO DE VOZ ====================
+        let trainRecorder = null;
+        let trainStream = null;
+        let trainChunks = [];
+        let trainTimer = null;
+        let trainAudioContext = null;
+        let trainAnalyser = null;
+        let trainVuRaf = null;
+
+        async function toggleTrainRecording() {
+            const btn = document.getElementById('btn-train-rec');
+            const statusBox = document.getElementById('train-status');
+            const player = document.getElementById('player-select').value;
+
+            if (!player) {
+                alert('Selecione primeiro o seu personagem no topo!');
+                return;
+            }
+
+            if (trainRecorder && trainRecorder.state === 'recording') {
+                stopTrainRecording();
+                return;
+            }
+
+            try {
+                trainStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                statusBox.style.display = 'block';
+                statusBox.className = 'alert-box alert-warn';
+                statusBox.innerText = '⚠️ O navegador bloqueou o microfone. No celular, o acesso ao microfone exige HTTPS ou permissão nas configurações do site.';
+                return;
+            }
+
+            // Configura VU meter
+            trainAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = trainAudioContext.createMediaStreamSource(trainStream);
+            trainAnalyser = trainAudioContext.createAnalyser();
+            trainAnalyser.fftSize = 256;
+            source.connect(trainAnalyser);
+            const dataArray = new Uint8Array(trainAnalyser.frequencyBinCount);
+            function updateVu() {
+                if (!trainAnalyser) return;
+                trainAnalyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                let avg = sum / dataArray.length;
+                let pct = Math.min(100, Math.round((avg / 128) * 100));
+                document.getElementById('train-vu').style.width = pct + '%';
+                trainVuRaf = requestAnimationFrame(updateVu);
+            }
+            updateVu();
+
+            trainChunks = [];
+            trainRecorder = new MediaRecorder(trainStream);
+            trainRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) trainChunks.push(e.data); };
+            trainRecorder.onstop = uploadTrainAudio;
+            trainRecorder.start(1000);
+
+            let remaining = 15;
+            btn.innerText = `⏹️ Gravando... (${remaining}s) Toque para Concluir`;
+            btn.className = 'btn btn-danger';
+            statusBox.style.display = 'block';
+            statusBox.className = 'alert-box alert-success';
+            statusBox.innerText = '🎙️ Leia a frase acima em tom natural...';
+
+            trainTimer = setInterval(() => {
+                remaining--;
+                if (remaining <= 0) {
+                    stopTrainRecording();
+                } else {
+                    btn.innerText = `⏹️ Gravando... (${remaining}s) Toque para Concluir`;
+                }
+            }, 1000);
+        }
+
+        function stopTrainRecording() {
+            if (trainTimer) clearInterval(trainTimer);
+            if (trainRecorder && trainRecorder.state === 'recording') trainRecorder.stop();
+            if (trainStream) trainStream.getTracks().forEach(t => t.stop());
+            if (trainVuRaf) cancelAnimationFrame(trainVuRaf);
+            if (trainAudioContext) trainAudioContext.close();
+            trainAnalyser = null;
+            document.getElementById('train-vu').style.width = '0%';
+            document.getElementById('btn-train-rec').innerText = '⏳ Processando e Enviando Treino...';
+            document.getElementById('btn-train-rec').className = 'btn btn-primary';
+        }
+
+        async function uploadTrainAudio() {
+            const statusBox = document.getElementById('train-status');
+            const player = document.getElementById('player-select').value;
+            const blob = new Blob(trainChunks, { type: 'audio/webm' });
+
+            statusBox.style.display = 'block';
+            statusBox.className = 'alert-box alert-success';
+            statusBox.innerText = '📤 Enviando amostra vocal para o RPG Chronicler...';
+
+            const reader = new FileReader();
+            reader.onloadend = async () => {
+                const b64 = reader.result;
+                try {
+                    const res = await fetch('/api/voice/train', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            player_label: player,
+                            audio_b64: b64,
+                            filename: 'mobile_train.webm'
+                        })
+                    });
+                    const data = await res.json();
+                    if (res.ok && data.status === 'ok') {
+                        statusBox.className = 'alert-box alert-success';
+                        statusBox.innerText = `✅ Sucesso! ${data.message || 'Perfil de voz reforçado.'}`;
+                    } else {
+                        statusBox.className = 'alert-box alert-warn';
+                        statusBox.innerText = `⚠️ Falha: ${data.message || 'Erro ao treinar.'}`;
+                    }
+                } catch (err) {
+                    statusBox.className = 'alert-box alert-warn';
+                    statusBox.innerText = '⚠️ Erro ao comunicar com o servidor do PC: ' + err.message;
+                } finally {
+                    document.getElementById('btn-train-rec').innerText = '🔴 Iniciar Gravação (15s)';
+                }
+            };
+            reader.readAsDataURL(blob);
+        }
+
+        // ==================== MICROFONE SATÉLITE DA SESSÃO ====================
+        let satRecorder = null;
+        let satStream = null;
+        let satWakeLock = null;
+        let satChunkIndex = 0;
+        let satClientId = 'sat_' + Math.random().toString(36).substr(2, 9);
+        let satAudioContext = null;
+        let satAnalyser = null;
+        let satVuRaf = null;
+
+        async function toggleSatellite() {
+            const btn = document.getElementById('btn-satellite');
+            const statusBox = document.getElementById('sat-status');
+            const player = document.getElementById('player-select').value;
+
+            if (!player) {
+                alert('Selecione seu personagem antes de ativar o microfone satélite!');
+                return;
+            }
+
+            if (satRecorder && satRecorder.state === 'recording') {
+                stopSatellite();
+                btn.innerText = '🎙️ Ativar Microfone Satélite';
+                btn.className = 'btn';
+                statusBox.style.display = 'none';
+                return;
+            }
+
+            try {
+                satStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                if ('wakeLock' in navigator) {
+                    try { satWakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+                }
+            } catch (err) {
+                statusBox.style.display = 'block';
+                statusBox.className = 'alert-box alert-warn';
+                statusBox.innerText = '⚠️ Não foi possível acessar o microfone. Verifique permissões ou HTTPS.';
+                return;
+            }
+
+            // VU meter satélite
+            satAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = satAudioContext.createMediaStreamSource(satStream);
+            satAnalyser = satAudioContext.createAnalyser();
+            satAnalyser.fftSize = 256;
+            source.connect(satAnalyser);
+            const dataArray = new Uint8Array(satAnalyser.frequencyBinCount);
+            function updateSatVu() {
+                if (!satAnalyser) return;
+                satAnalyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                let avg = sum / dataArray.length;
+                let pct = Math.min(100, Math.round((avg / 128) * 100));
+                document.getElementById('sat-vu').style.width = pct + '%';
+                satVuRaf = requestAnimationFrame(updateSatVu);
+            }
+            updateSatVu();
+
+            satChunkIndex = 0;
+            satRecorder = new MediaRecorder(satStream);
+            satRecorder.ondataavailable = async e => {
+                if (e.data && e.data.size > 0) {
+                    sendSatelliteChunk(e.data, satChunkIndex++);
+                }
+            };
+            satRecorder.start(6000); // chunks de 6 segundos
+
+            btn.innerText = '🛑 Desativar Microfone Satélite';
+            btn.className = 'btn btn-satellite-on';
+            statusBox.style.display = 'block';
+            statusBox.className = 'alert-box alert-success';
+            statusBox.innerText = '🟢 Satélite Ativo! Transmitindo proximidade para a mesa...';
+        }
+
+        function stopSatellite() {
+            if (satRecorder && satRecorder.state === 'recording') satRecorder.stop();
+            if (satStream) satStream.getTracks().forEach(t => t.stop());
+            if (satWakeLock) { satWakeLock.release(); satWakeLock = null; }
+            if (satVuRaf) cancelAnimationFrame(satVuRaf);
+            if (satAudioContext) satAudioContext.close();
+            satAnalyser = null;
+            document.getElementById('sat-vu').style.width = '0%';
+        }
+
+        async function sendSatelliteChunk(blob, index) {
+            const player = document.getElementById('player-select').value;
+            const reader = new FileReader();
+            reader.onloadend = async () => {
+                try {
+                    await fetch('/api/satellite/chunk', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            player_label: player,
+                            client_id: satClientId,
+                            chunk_index: index,
+                            timestamp: Date.now() / 1000,
+                            audio_b64: reader.result
+                        })
+                    });
+                } catch(e) {}
+            };
+            reader.readAsDataURL(blob);
+        }
+
+        // ==================== MARCADORES & ESTADO ====================
         async function fetchState() {
             try {
                 const res = await fetch('/api/session');
                 const d = await res.json();
                 if (d.title) document.getElementById('sess-title').innerText = d.title;
                 if (d.status) document.getElementById('sess-status').innerText = d.status;
+                if (d.duration) document.getElementById('sess-duration').innerText = d.duration;
                 if (d.recent_dialogues && d.recent_dialogues.length > 0) {
-                    document.getElementById('dialogues').innerHTML = d.recent_dialogues.slice(-6).map(s =>
+                    document.getElementById('dialogues').innerHTML = d.recent_dialogues.slice(-8).map(s =>
                         `<div class="dialogue-item"><span class="speaker">${s.speaker || 'Voz'}:</span> ${s.text}</div>`
                     ).join('');
                 }
                 if (d.highlights && d.highlights.length > 0) {
-                    document.getElementById('highlights').innerHTML = d.highlights.slice(-4).map(h =>
-                        `<div class="dialogue-item"><span class="highlight-badge">[${h.category.toUpperCase()}]</span> ${h.description || 'Destaque'} (${h.formatted_time || ''})</div>`
+                    document.getElementById('highlights').innerHTML = d.highlights.slice(-5).map(h =>
+                        `<div class="dialogue-item"><span class="highlight-badge">[${(h.category || 'DESTAQUE').toUpperCase()}]</span> ${h.description || 'Destaque'} (${h.formatted_time || ''})</div>`
                     ).join('');
                 }
             } catch (e) {}
         }
+
         async function sendHighlight(cat, desc) {
             try {
                 await fetch('/api/highlight', {
@@ -2920,9 +3502,12 @@ class RPGCompanionWebServer:
                 fetchState();
             } catch(e) { alert('Erro ao enviar marcador.'); }
         }
+
         setInterval(fetchState, 3000);
+        loadParticipants();
         fetchState();
     </script>
 </body>
 </html>
 """
+
