@@ -306,6 +306,203 @@ def extract_extended_acoustic_features(audio_segment, sample_rate=16000, num_mfc
     return np.hstack([base_feat, extra_metrics, delta_mfcc]).astype(np.float32)
 
 
+def fuse_satellite_audio_tracks(master_wav: str, satellite_tracks: "dict[str, str]", segments: list, fallback_tags: list, dominance_ratio: float = 1.4) -> list:
+    """Sobrescreve os rótulos de diarização com base na energia RMS de microfones satélites.
+
+    Parâmetros
+    ----------
+    master_wav : str
+        Caminho para o WAV master (microfone de conferência do PC).
+    satellite_tracks : dict[str, str]
+        Mapeamento {player_label -> caminho WAV contínuo do satélite}.
+        Cada WAV satélite deve estar alinhado temporalmente ao master
+        (mesmo instante t=0 da gravação).
+    segments : list[dict]
+        Segmentos do Whisper com 'start', 'end', 'text'.
+    fallback_tags : list[str]
+        Rótulos gerados pela diarização acústica/pyannote para usar quando
+        nenhum satélite domina claramente.
+    dominance_ratio : float
+        Fator mínimo pelo qual o satélite mais alto deve superar o segundo
+        mais alto para ser aceito como falante.  Default: 1.4 (40% acima).
+
+    Retorna
+    -------
+    list[str]
+        Lista de rótulos, um por segmento.  Satélites confirmados produzem
+        o label do jogador (ex: "Lorenzo (Raphael)"); os demais mantêm o
+        fallback original.
+    """
+    if not satellite_tracks:
+        return list(fallback_tags)
+
+    # ── Carrega áudios ──────────────────────────────────────────────────────
+    def _load_mono(path):
+        sr, data = wavfile.read(path)
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+        data = data.astype(np.float32)
+        return sr, data
+
+    try:
+        master_sr, master_data = _load_mono(master_wav)
+    except Exception:
+        LOGGER.warning("fuse_satellite: não foi possível carregar master; retornando fallback.")
+        return list(fallback_tags)
+
+    sat_data: dict[str, tuple] = {}  # label -> (sr, array)
+    for label, path in satellite_tracks.items():
+        try:
+            sr, data = _load_mono(path)
+            sat_data[label] = (sr, data)
+        except Exception as exc:
+            LOGGER.warning("fuse_satellite: ignorando satélite '%s': %s", label, exc)
+
+    if not sat_data:
+        return list(fallback_tags)
+
+    def _rms_slice(data, sr, t_start, t_end):
+        """RMS de um trecho [t_start, t_end] segundos."""
+        s = int(t_start * sr)
+        e = int(t_end * sr)
+        chunk = data[s:e]
+        if len(chunk) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(chunk ** 2)))
+
+    result_tags = []
+    for idx, (seg, fallback) in enumerate(zip(segments, fallback_tags)):
+        t0, t1 = float(seg["start"]), float(seg["end"])
+        if t1 - t0 < 0.05:
+            result_tags.append(fallback)
+            continue
+
+        # Energia de cada satélite no janelamento deste segmento
+        energies: dict[str, float] = {}
+        for label, (sr, data) in sat_data.items():
+            energies[label] = _rms_slice(data, sr, t0, t1)
+
+        sorted_labels = sorted(energies, key=energies.get, reverse=True)
+        if not sorted_labels:
+            result_tags.append(fallback)
+            continue
+
+        top_label = sorted_labels[0]
+        top_energy = energies[top_label]
+
+        if len(sorted_labels) >= 2:
+            second_energy = energies[sorted_labels[1]]
+        else:
+            second_energy = 0.0
+
+        # Valida dominância: o satélite líder deve ser dominance_ratio vezes
+        # o segundo e também superar o nível de ruído mínimo (RMS > 1e-4)
+        master_energy = _rms_slice(master_data, master_sr, t0, t1)
+        noise_floor = max(1e-4, master_energy * 0.1)
+
+        if top_energy > noise_floor and top_energy >= dominance_ratio * max(second_energy, noise_floor):
+            LOGGER.debug(
+                "fuse_satellite: seg %d [%.1f-%.1f] → %s (RMS %.4f vs %.4f)",
+                idx, t0, t1, top_label, top_energy, second_energy,
+            )
+            result_tags.append(top_label)
+        else:
+            result_tags.append(fallback)
+
+    return result_tags
+
+
+def assemble_satellite_wav(chunks_dir: str, output_wav: str, session_start_utc: float, total_duration_s: float, sample_rate: int = 16000) -> bool:
+    """Monta um WAV contínuo alinhado ao master a partir de chunks ordenados.
+
+    Os chunks são arquivos WAV salvos pelo endpoint /api/satellite/chunk, com
+    nomes como ``{chunk_index:06d}_{timestamp_utc:.3f}.wav``.
+
+    Parâmetros
+    ----------
+    chunks_dir : str
+        Pasta contendo os chunks de um único satélite/jogador.
+    output_wav : str
+        Caminho do arquivo WAV de saída já alinhado.
+    session_start_utc : float
+        Unix timestamp (float) do início da gravação master.
+    total_duration_s : float
+        Duração total do áudio master em segundos.
+    sample_rate : int
+        Taxa de amostragem alvo (default 16000 Hz, igual ao Whisper).
+
+    Retorna
+    -------
+    bool
+        True se ao menos um chunk foi inserido; False caso contrário.
+    """
+    import glob, struct
+
+    chunks_dir_path = Path(chunks_dir)
+    pattern = str(chunks_dir_path / "*.wav")
+    chunk_files = sorted(glob.glob(pattern))
+
+    if not chunk_files:
+        LOGGER.warning("assemble_satellite_wav: nenhum chunk em '%s'", chunks_dir)
+        return False
+
+    total_samples = int(total_duration_s * sample_rate)
+    timeline = np.zeros(total_samples, dtype=np.float32)
+
+    inserted = 0
+    for cf in chunk_files:
+        # Nome esperado: "000001_1725480012.345.wav"
+        stem = Path(cf).stem
+        parts = stem.split("_", 1)
+        if len(parts) < 2:
+            continue
+        try:
+            chunk_ts = float(parts[1])
+        except ValueError:
+            continue
+
+        offset_s = chunk_ts - session_start_utc
+        if offset_s < 0:
+            LOGGER.debug("assemble_satellite_wav: chunk %s antes do início; ignorando.", cf)
+            continue
+
+        try:
+            sr_chunk, data_chunk = wavfile.read(cf)
+        except Exception:
+            continue
+
+        if data_chunk.ndim > 1:
+            data_chunk = np.mean(data_chunk, axis=1)
+        data_chunk = data_chunk.astype(np.float32)
+
+        # Reamostrar se necessário
+        if sr_chunk != sample_rate:
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(sample_rate, sr_chunk)
+            data_chunk = resample_poly(data_chunk, sample_rate // g, sr_chunk // g).astype(np.float32)
+
+        start_sample = int(offset_s * sample_rate)
+        end_sample = start_sample + len(data_chunk)
+        actual_end = min(end_sample, total_samples)
+        actual_len = actual_end - start_sample
+        if actual_len > 0:
+            timeline[start_sample:actual_end] += data_chunk[:actual_len]
+            inserted += 1
+
+    if inserted == 0:
+        return False
+
+    # Normaliza para evitar clipping e salva como int16
+    peak = np.max(np.abs(timeline))
+    if peak > 0:
+        timeline = timeline / peak * 0.95
+    out_int16 = (timeline * 32767).astype(np.int16)
+    wavfile.write(output_wav, sample_rate, out_int16)
+    LOGGER.info("assemble_satellite_wav: %d chunks → '%s'", inserted, output_wav)
+    return True
+
+
 def perform_acoustic_diarization(wav_path, segments, estimated_speakers=4, progress_callback=None, return_centroids=False, cancel_event=None):
     """Lê o arquivo de áudio e agrupa os segmentos transcritos por timbre de voz."""
     sample_rate, audio_data = wavfile.read(wav_path)
@@ -1550,6 +1747,12 @@ class RPGChroniclerApp:
         self.highlight_manager = TimelineHighlightManager()
         self.companion_server = RPGCompanionWebServer()
         self.companion_server.highlight_callback = self._on_companion_remote_highlight
+        self.companion_server.voice_train_callback = self._on_companion_voice_train
+        self.companion_server.satellite_chunk_callback = self._on_companion_satellite_chunk
+        self.companion_server.get_participants_callback = self._on_companion_get_participants
+        # Estado de satélite desta sessão: {player_label: [chunk_path, ...]}
+        self._satellite_session: dict = {}
+        self._satellite_session_start_utc: float = 0.0
 
         self.create_widgets()
         self.update_timer_loop()
@@ -3447,6 +3650,80 @@ class RPGChroniclerApp:
             "formatted_time": hl.formatted_time,
         }
 
+    def _on_companion_get_participants(self) -> list:
+        """Retorna a lista de participantes configurados na sessão atual."""
+        try:
+            raw = self.options_cfg.get("participants", []) if hasattr(self, "options_cfg") else []
+            if not raw and hasattr(self, "txt_participantes"):
+                raw_text = self.txt_participantes.get("1.0", "end").strip()
+                raw = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        except Exception:
+            raw = []
+        result = []
+        for entry in raw:
+            if isinstance(entry, dict):
+                result.append(entry)
+            else:
+                result.append({"label": str(entry), "name": str(entry)})
+        return result
+
+    def _on_companion_voice_train(self, player_label: str, wav_path: str) -> dict:
+        """Recebe áudio de treino de voz enviado pelo Companion e atualiza o perfil."""
+        try:
+            trained = train_voice_profile_from_audio(player_label, wav_path)
+            LOGGER.info("Companion voice-train: perfil '%s' atualizado.", player_label)
+            self.root.after(0, self.update_bank_status_label)
+            return {"ok": True, "player": player_label, "trained": trained}
+        except Exception as exc:
+            LOGGER.warning("Companion voice-train erro para '%s': %s", player_label, exc)
+            return {"ok": False, "error": str(exc)}
+
+    def _on_companion_satellite_chunk(
+        self,
+        player_label: str,
+        client_id: str,
+        chunk_index: int,
+        timestamp_utc: float,
+        audio_bytes: bytes,
+    ) -> dict:
+        """Recebe um chunk de áudio do microfone satélite e salva em disco.
+
+        Os chunks são nomeados como ``{chunk_index:06d}_{timestamp_utc:.3f}.wav``
+        dentro de ``session_satellites/{player_label}/``, para que a função
+        ``assemble_satellite_wav`` possa reconstruir a faixa contínua depois.
+        """
+        import tempfile, wave as wave_module
+
+        try:
+            # Determina a pasta da sessão satélite (mesma que a gravação master)
+            session_dir = Path(self.recorder.output_path).parent if (
+                hasattr(self, "recorder") and hasattr(self.recorder, "output_path") and self.recorder.output_path
+            ) else Path(tempfile.gettempdir())
+
+            sat_dir = session_dir / "session_satellites" / player_label
+            sat_dir.mkdir(parents=True, exist_ok=True)
+
+            # Registra o timestamp de início da sessão (primeiro chunk recebido)
+            if self._satellite_session_start_utc == 0.0 and timestamp_utc > 0:
+                self._satellite_session_start_utc = timestamp_utc
+                LOGGER.info("Satélite: primeiro chunk de '%s' em t=%.3f", player_label, timestamp_utc)
+
+            chunk_filename = sat_dir / f"{chunk_index:06d}_{timestamp_utc:.3f}.wav"
+            # Salva bytes diretamente; o frontend envia WAV ou WebM — tenta salvar como WAV
+            chunk_filename.write_bytes(audio_bytes)
+
+            # Mantém registro em memória para acesso rápido durante o pós-processamento
+            self._satellite_session.setdefault(player_label, [])
+            chunk_path_str = str(chunk_filename)
+            if chunk_path_str not in self._satellite_session[player_label]:
+                self._satellite_session[player_label].append(chunk_path_str)
+
+            return {"ok": True, "player": player_label, "chunk": chunk_index, "saved": str(chunk_filename)}
+        except Exception as exc:
+            LOGGER.warning("Satellite chunk erro para '%s' chunk %d: %s", player_label, chunk_index, exc)
+            return {"ok": False, "error": str(exc)}
+
+
     def toggle_companion_server(self):
         if self.companion_server.is_running():
             self.companion_server.stop()
@@ -3847,7 +4124,48 @@ class RPGChroniclerApp:
                     return_centroids=True, cancel_event=self.cancel_event
                 )
 
+            # 2.1 Fusão de Microfones Satélite (celulares dos jogadores)
+            # Se chunks de satélite foram coletados durante a gravação, monta as
+            # faixas contínuas e refina os rótulos usando proximidade acústica RMS.
+            try:
+                sat_session = getattr(self, "_satellite_session", {})
+                if sat_session:
+                    session_dir = Path(audio_path).parent
+                    total_dur = prepared_audio.metadata.duration_seconds
+                    session_start = getattr(self, "_satellite_session_start_utc", 0.0)
+                    satellite_wavs: dict = {}
+                    for player_lbl, _chunks in sat_session.items():
+                        chunks_folder = session_dir / "session_satellites" / player_lbl
+                        out_wav = session_dir / "session_satellites" / f"{player_lbl}_assembled.wav"
+                        ok = assemble_satellite_wav(
+                            str(chunks_folder), str(out_wav),
+                            session_start_utc=session_start,
+                            total_duration_s=total_dur,
+                        )
+                        if ok:
+                            satellite_wavs[player_lbl] = str(out_wav)
+                            LOGGER.info("Satélite montado para '%s': %s", player_lbl, out_wav)
+
+                    if satellite_wavs:
+                        self.update_ui_progress(
+                            47,
+                            f"🛰️ [2.1/6] Fusão de Satélites ({len(satellite_wavs)} microfone(s))",
+                            "Refinando identificação de falantes por proximidade de microfone...",
+                            color=self.colors["accent_bright"],
+                        )
+                        voice_tags = fuse_satellite_audio_tracks(
+                            master_wav=audio_path,
+                            satellite_tracks=satellite_wavs,
+                            segments=segments,
+                            fallback_tags=voice_tags,
+                            dominance_ratio=1.4,
+                        )
+                        LOGGER.info("Fusão satélite concluída: %d segmentos refinados.", len(voice_tags))
+            except Exception as sat_exc:
+                LOGGER.warning("Fusão satélite falhou (não crítico): %s", sat_exc)
+
             # Carrega perfis salvos e faz matching acústico preditivo
+
             saved_profiles = load_voice_profiles()
             voice_predictions = match_voice_clusters_to_profiles(cluster_centroids, saved_profiles)
 

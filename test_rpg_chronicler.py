@@ -35,6 +35,8 @@ from rpg_chronicler import (
     perform_acoustic_diarization,
     train_voice_profile_from_audio,
     update_voice_profile_online,
+    fuse_satellite_audio_tracks,
+    assemble_satellite_wav,
 )
 from rpg_chronicler_core import (
     SessionRun,
@@ -1342,9 +1344,115 @@ class RPGChroniclerTests(unittest.TestCase):
         self.assertEqual(highlight_received[0][0], "epic")
         self.assertEqual(highlight_received[0][1], "Guerreiro derrubou o chefe")
 
+
         # Finaliza servidor
         server.stop()
         self.assertFalse(server.is_running())
+
+
+class TestSatelliteFusion(unittest.TestCase):
+    """Testes para assemble_satellite_wav e fuse_satellite_audio_tracks."""
+
+    def _write_sine_wav(self, path, freq_hz, duration_s, sample_rate=16000, amplitude=0.8):
+        """Cria um arquivo WAV com um sinal senoidal."""
+        t = np.linspace(0, duration_s, int(sample_rate * duration_s), endpoint=False)
+        data = (amplitude * np.sin(2 * np.pi * freq_hz * t) * 32767).astype(np.int16)
+        wavfile.write(path, sample_rate, data)
+
+    def test_assemble_satellite_wav_basic(self):
+        """assemble_satellite_wav deve montar os chunks na posição correta da timeline."""
+        import tempfile, os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sr = 16000
+            session_start = 1000.0  # Unix timestamp arbitrário
+            chunk_dir = os.path.join(tmpdir, "Lorenzo")
+            os.makedirs(chunk_dir)
+
+            # Chunk 0: começa no instante 0 da sessão (t=session_start)
+            t0_file = os.path.join(chunk_dir, f"000000_{session_start:.3f}.wav")
+            self._write_sine_wav(t0_file, freq_hz=440, duration_s=2.0, sample_rate=sr)
+
+            # Chunk 1: começa 4 s depois do início
+            t1_file = os.path.join(chunk_dir, f"000001_{session_start + 4.0:.3f}.wav")
+            self._write_sine_wav(t1_file, freq_hz=880, duration_s=2.0, sample_rate=sr)
+
+            out_wav = os.path.join(tmpdir, "assembled.wav")
+            result = assemble_satellite_wav(
+                chunk_dir, out_wav,
+                session_start_utc=session_start,
+                total_duration_s=8.0,
+                sample_rate=sr,
+            )
+            self.assertTrue(result)
+            self.assertTrue(os.path.isfile(out_wav))
+
+            out_sr, out_data = wavfile.read(out_wav)
+            self.assertEqual(out_sr, sr)
+            # Devem existir 8 segundos de amostras (8 * 16000 = 128000)
+            self.assertEqual(len(out_data), 8 * sr)
+
+            # Energia no intervalo [4s, 6s] deve ser maior que em [2s, 4s] (silêncio)
+            rms_active = float(np.sqrt(np.mean(out_data[4 * sr:6 * sr].astype(np.float32) ** 2)))
+            rms_silent = float(np.sqrt(np.mean(out_data[2 * sr:4 * sr].astype(np.float32) ** 2)))
+            self.assertGreater(rms_active, rms_silent)
+
+    def test_fuse_satellite_audio_tracks_dominant(self):
+        """fuse_satellite_audio_tracks deve identificar o satélite dominante."""
+        import tempfile, os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sr = 16000
+            duration = 10.0
+            n = int(sr * duration)
+
+            # Satélite Lorenzo: alto nos primeiros 3 s
+            t = np.linspace(0, duration, n, endpoint=False)
+            lorenzo_data = np.zeros(n, dtype=np.float32)
+            lorenzo_data[:3 * sr] = 0.9 * np.sin(2 * np.pi * 440 * t[:3 * sr])
+
+            # Satélite Wilson: alto de 5 s a 8 s
+            wilson_data = np.zeros(n, dtype=np.float32)
+            wilson_data[5 * sr:8 * sr] = 0.9 * np.sin(2 * np.pi * 880 * t[5 * sr:8 * sr])
+
+            # Master: ruído branco fraco durante toda a sessão
+            master_data = (0.05 * np.random.randn(n)).astype(np.float32)
+
+            def _save(path, data):
+                wavfile.write(path, sr, (data * 32767).astype(np.int16))
+
+            master_wav = os.path.join(tmpdir, "master.wav")
+            lorenzo_wav = os.path.join(tmpdir, "lorenzo.wav")
+            wilson_wav = os.path.join(tmpdir, "wilson.wav")
+            _save(master_wav, master_data)
+            _save(lorenzo_wav, lorenzo_data)
+            _save(wilson_wav, wilson_data)
+
+            segments = [
+                {"start": 0.5, "end": 2.5, "text": "Fala de Lorenzo"},    # Lorenzo domina
+                {"start": 5.5, "end": 7.5, "text": "Fala de Wilson"},     # Wilson domina
+                {"start": 3.0, "end": 4.5, "text": "Fala ambígua"},       # Nenhum domina → fallback
+            ]
+            fallback_tags = ["Voz Física #1", "Voz Física #2", "Voz Física #3"]
+
+            tags = fuse_satellite_audio_tracks(
+                master_wav=master_wav,
+                satellite_tracks={"Lorenzo (Raphael)": lorenzo_wav, "Wilson (Bruxo)": wilson_wav},
+                segments=segments,
+                fallback_tags=fallback_tags,
+                dominance_ratio=1.4,
+            )
+
+            self.assertEqual(tags[0], "Lorenzo (Raphael)", f"Esperado Lorenzo, obteve: {tags[0]}")
+            self.assertEqual(tags[1], "Wilson (Bruxo)", f"Esperado Wilson, obteve: {tags[1]}")
+            self.assertEqual(tags[2], "Voz Física #3", f"Segmento ambíguo deveria manter fallback, obteve: {tags[2]}")
+
+    def test_fuse_satellite_empty_tracks(self):
+        """fuse_satellite_audio_tracks com dicionário vazio retorna os fallbacks intactos."""
+        segments = [{"start": 0.0, "end": 1.0, "text": "oi"}]
+        fallback_tags = ["Voz Física #1"]
+        tags = fuse_satellite_audio_tracks("qualquer.wav", {}, segments, fallback_tags)
+        self.assertEqual(tags, fallback_tags)
 
 
 if __name__ == "__main__":
