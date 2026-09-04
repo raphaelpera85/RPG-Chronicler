@@ -20,15 +20,22 @@ from tkinter import ttk, messagebox, filedialog, scrolledtext
 if sys.platform == "win32":
     import site
     search_dirs = site.getsitepackages() + [site.getusersitepackages()]
+    target_kws = ('nvidia', 'cuda', 'cublas', 'cudnn', 'ctranslate2', 'torch')
     for base_p in search_dirs:
         if os.path.exists(base_p):
-            for root, dirs, files in os.walk(base_p):
-                if any(f.endswith('.dll') for f in files) and any(kw in root.lower() for kw in ['nvidia', 'cuda', 'cublas', 'cudnn', 'ctranslate2', 'torch']):
-                    try:
-                        os.add_dll_directory(root)
-                    except Exception:
-                        pass
-                    os.environ["PATH"] = root + os.pathsep + os.environ["PATH"]
+            try:
+                with os.scandir(base_p) as it:
+                    for entry in it:
+                        if entry.is_dir() and any(kw in entry.name.lower() for kw in target_kws):
+                            for root, dirs, files in os.walk(entry.path):
+                                if any(f.endswith('.dll') for f in files):
+                                    try:
+                                        os.add_dll_directory(root)
+                                    except Exception:
+                                        pass
+                                    os.environ["PATH"] = root + os.pathsep + os.environ["PATH"]
+            except Exception:
+                pass
 
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -67,6 +74,29 @@ from rpg_chronicler_core import (
     apply_dereverberation,
     enhance_audio_pipeline,
     clean_and_enhance_audio_file,
+    apply_deesser,
+    apply_podcast_equalizer,
+    calculate_integrated_lufs,
+    apply_loudness_normalization,
+    detect_overlapping_speech,
+    master_podcast_audio,
+    master_podcast_audio_file,
+    extract_campaign_vocabulary,
+    build_whisper_prompt_bias,
+    normalize_rpg_transcript_mechanics,
+    apply_whisper_sensitive_vad,
+    apply_plosive_suppression,
+    apply_auto_ducking,
+    apply_cross_bleed_cancellation,
+    acting_invariant_feature_distance,
+)
+from agents import (
+    PodcastAudioEngineerAgent,
+    ShowNotesAndChaptersAgent,
+    SocialClipsViralScoutAgent,
+    NarrativeLoreKeeperAgent,
+    AudiogramVisualizerAgent,
+    run_all_runtime_specialists,
 )
 
 # Diretórios
@@ -136,16 +166,18 @@ def extract_acoustic_features(audio_segment, sample_rate=16000, num_mfcc=16):
     if max_val > 0:
         audio_segment = audio_segment / max_val
 
-    # Estimativa de Pitch fundamental (F0) por autocorrelação normalizada
+    # Estimativa de Pitch fundamental (F0) por autocorrelação normalizada com busca no intervalo vocal humano
     try:
-        corr = signal.fftconvolve(audio_segment, audio_segment[::-1], mode='full')
-        corr = corr[len(audio_segment) - 1:]
-        d = np.diff(corr)
-        start_idx = np.where(d > 0)[0]
-        if len(start_idx) > 0:
-            peak = np.argmax(corr[start_idx[0]:]) + start_idx[0]
+        sig_centered = audio_segment - np.mean(audio_segment)
+        corr = signal.fftconvolve(sig_centered, sig_centered[::-1], mode='full')
+        corr = corr[len(sig_centered) - 1:]
+        min_lag = max(1, int(sample_rate / 400.0))
+        max_lag = min(len(corr) - 1, int(sample_rate / 60.0))
+        if max_lag > min_lag:
+            search_region = corr[min_lag:max_lag]
+            peak_rel = int(np.argmax(search_region))
+            peak = min_lag + peak_rel
             f0 = sample_rate / peak if peak > 0 else 0.0
-            # Frequência vocal humana típica entre 60Hz e 400Hz
             pitch = float(f0) if 60 <= f0 <= 400 else 150.0
         else:
             pitch = 150.0
@@ -214,6 +246,53 @@ def extract_acoustic_features(audio_segment, sample_rate=16000, num_mfcc=16):
     return raw_feat.astype(np.float32)
 
 
+def extract_extended_acoustic_features(audio_segment, sample_rate=16000, num_mfcc=16):
+    """
+    Extrator de características de alta resolução (52 dimensões).
+    Combina os 38 parâmetros base (MFCCs, F0, Centroid, RMS, Zero Crossing, Rolloff, Flux)
+    com 14 métricas biométricas adicionais:
+    - Formantes vocais F1 e F2 (estimativa de ressonância do trato vocal)
+    - Harmonics-to-Noise Ratio (HNR em dB)
+    - Entropia e Achatamento Espectral (Spectral Flatness)
+    - Fator de Crista Espectral (Spectral Crest)
+    - Dispersão Espectral (Spectral Spread)
+    - 8 Deltas de MFCC (dinâmica temporal de fala)
+    """
+    base_feat = extract_acoustic_features(audio_segment, sample_rate=sample_rate, num_mfcc=num_mfcc)
+    if len(audio_segment) < sample_rate * 0.25:
+        return np.zeros(num_mfcc * 2 + 6 + 14, dtype=np.float32)
+
+    seg = audio_segment[: sample_rate * 8].astype(np.float32)
+    fft_mag = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), n=512))
+    freqs = np.fft.rfftfreq(512, d=1.0 / sample_rate)
+
+    f1_mask = (freqs >= 250) & (freqs <= 1000)
+    f2_mask = (freqs >= 1000) & (freqs <= 2800)
+    f1 = float(freqs[f1_mask][np.argmax(fft_mag[f1_mask])]) if np.any(f1_mask) else 500.0
+    f2 = float(freqs[f2_mask][np.argmax(fft_mag[f2_mask])]) if np.any(f2_mask) else 1500.0
+
+    pow_spec = fft_mag**2
+    harmonic_pow = float(np.percentile(pow_spec, 90))
+    noise_pow = float(np.percentile(pow_spec, 20)) + 1e-8
+    hnr = float(np.clip(10.0 * np.log10(max(1e-4, harmonic_pow / noise_pow)), -10.0, 40.0))
+
+    geom_mean = np.exp(np.mean(np.log(fft_mag + 1e-8)))
+    arith_mean = np.mean(fft_mag) + 1e-8
+    flatness = float(np.clip(geom_mean / arith_mean, 0.0, 1.0))
+    crest = float(np.max(fft_mag) / arith_mean)
+
+    centroid = base_feat[num_mfcc * 2 + 1]
+    spread = float(np.sqrt(np.mean(((freqs - centroid) ** 2) * (fft_mag / arith_mean))))
+
+    delta_mfcc = np.zeros(8, dtype=np.float32)
+    mfcc_means = base_feat[:num_mfcc]
+    for k in range(8):
+        delta_mfcc[k] = mfcc_means[min(num_mfcc - 1, k + 1)] - mfcc_means[k]
+
+    extra_metrics = np.array([f1, f2, hnr, flatness, crest, spread], dtype=np.float32)
+    return np.hstack([base_feat, extra_metrics, delta_mfcc]).astype(np.float32)
+
+
 def perform_acoustic_diarization(wav_path, segments, estimated_speakers=4, progress_callback=None, return_centroids=False, cancel_event=None):
     """Lê o arquivo de áudio e agrupa os segmentos transcritos por timbre de voz."""
     sample_rate, audio_data = wavfile.read(wav_path)
@@ -223,10 +302,6 @@ def perform_acoustic_diarization(wav_path, segments, estimated_speakers=4, progr
     features_list = []
     valid_indices = []
     total_segs = len(segments)
-    # Sessões longas podem gerar milhares de segmentos. Extrair MFCC/F0 para
-    # todos eles torna a etapa quadrática (e pode parecer que a GUI travou).
-    # Amostramos no máximo 1.500 segmentos distribuídos no tempo e depois
-    # propagamos o rótulo ao segmento original mais próximo.
     max_feature_segments = 1500
     if total_segs > max_feature_segments:
         sampled_indices = np.linspace(0, total_segs - 1, max_feature_segments, dtype=int).tolist()
@@ -241,6 +316,12 @@ def perform_acoustic_diarization(wav_path, segments, estimated_speakers=4, progr
         end_sample = int(seg['end'] * sample_rate)
         chunk = audio_data[start_sample:end_sample]
         
+        # Detector de fala sobreposta
+        osd_result = detect_overlapping_speech(chunk, sample_rate=sample_rate)
+        if osd_result.get("is_overlapping"):
+            seg["is_overlapping"] = True
+            seg["overlap_confidence"] = osd_result.get("confidence", 0.0)
+
         feat = extract_acoustic_features(chunk, sample_rate=sample_rate)
         features_list.append(feat)
         valid_indices.append(idx)
@@ -433,6 +514,19 @@ def normalized_voice_similarity(v1, v2):
     return max(0.0, min(1.0, (r + 1.0) / 2.0))
 
 
+def acting_tolerant_voice_similarity(v1, v2, acting_weight: float = 0.30) -> float:
+    """
+    Similaridade Tolerante a Interpretação (Acting & Roleplay Matcher):
+    Combina correlação de Pearson z-score com a distância acústica invariante do trato vocal,
+    garantindo que variações intencionais de tom (sussurros, gritos, interpretação de NPCs)
+    não descaracterizem a identidade do jogador.
+    """
+    base_sim = normalized_voice_similarity(v1, v2)
+    inv_dist = acting_invariant_feature_distance(v1, v2)
+    inv_sim = max(0.0, min(1.0, 1.0 - inv_dist))
+    return float((1.0 - acting_weight) * base_sim + acting_weight * inv_sim)
+
+
 def calculate_voice_profiles_separability(profiles=None):
     """
     Avalia a separabilidade e saúde do banco de vozes.
@@ -525,7 +619,7 @@ def match_voice_clusters_to_profiles(cluster_centroids, profiles, threshold=0.72
     for i, c_feat in enumerate(cluster_feats):
         for j, p_feat in enumerate(player_feats):
             if len(c_feat) == len(p_feat) and is_valid_voice_embedding(p_feat):
-                sim_matrix[i, j] = normalized_voice_similarity(c_feat, p_feat)
+                sim_matrix[i, j] = acting_tolerant_voice_similarity(c_feat, p_feat)
             else:
                 sim_matrix[i, j] = 0.0
 
@@ -577,7 +671,7 @@ def match_voice_clusters_to_profiles(cluster_centroids, profiles, threshold=0.72
             for player_name, p_data in profiles.items():
                 p_feat = p_data.get("embedding", [])
                 if len(p_feat) == len(feat):
-                    sim = normalized_voice_similarity(feat, p_feat)
+                    sim = acting_tolerant_voice_similarity(feat, p_feat)
                     score = sim * (0.88 if player_name in used_players else 1.0)
                     if score > best_score:
                         best_score = score
@@ -644,6 +738,54 @@ def update_voice_profiles(user_confirmed_mapping, cluster_centroids):
 
     save_voice_profiles(profiles)
     print(f"[Perfis] Banco de vozes atualizado com sucesso ({len(profiles)} perfis registrados).")
+
+
+def update_voice_profile_online(
+    speaker_label: str,
+    new_features: np.ndarray | list[float],
+    profiles: dict | None = None,
+    alpha: float = 0.90,
+    min_confidence: float = 0.75,
+) -> bool:
+    """
+    Aprendizado Contínuo com Momentum (Online Adaptive Calibration):
+    Refina o centróide acústico de um jogador durante a sessão quando houver alta
+    confiança na identificação ou confirmação explícita na interface.
+    Preserva estritamente a dimensão 38-D do vetor e salva atomicamente.
+    """
+    if not speaker_label or any(ign in speaker_label for ign in ["Off-Game", "Não Identificada", "Desconhecido"]):
+        return False
+
+    feat = np.array(new_features, dtype=np.float32)
+    if not is_valid_voice_embedding(feat):
+        return False
+
+    profs = profiles if profiles is not None else load_voice_profiles()
+    if speaker_label not in profs:
+        profs[speaker_label] = {
+            "embedding": feat.tolist(),
+            "sample_count": 1,
+            "created_at": datetime.now().isoformat(),
+            "last_updated": datetime.now().isoformat(),
+            "last_adapted": datetime.now().isoformat(),
+        }
+        if profiles is None:
+            save_voice_profiles(profs)
+        return True
+
+    old_emb = np.array(profs[speaker_label].get("embedding", []), dtype=np.float32)
+    if len(old_emb) != len(feat) or not is_valid_voice_embedding(old_emb):
+        return False
+
+    # Atualização exponencial com decaimento suave (momentum)
+    updated_emb = (alpha * old_emb) + ((1.0 - alpha) * feat)
+    profs[speaker_label]["embedding"] = updated_emb.tolist()
+    profs[speaker_label]["sample_count"] = min(100, profs[speaker_label].get("sample_count", 1) + 1)
+    profs[speaker_label]["last_adapted"] = datetime.now().isoformat()
+
+    if profiles is None:
+        save_voice_profiles(profs)
+    return True
 
 
 def format_participant_voice_label(participant):
@@ -2619,12 +2761,20 @@ class RPGChroniclerApp:
         tab_novel_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
         tab_webtoon_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
         tab_biblia_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
+        tab_podcast_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
+        tab_clips_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
+        tab_dados_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
+        tab_grafo_view = tk.Frame(sub_notebook, bg=self.colors["bg"])
 
         sub_notebook.add(tab_trans_view, text="🗣️ Transcrição por Vozes")
         sub_notebook.add(tab_resumo_view, text="📖 Diário da Sessão")
         sub_notebook.add(tab_novel_view, text="📚 Capítulo de Light Novel")
         sub_notebook.add(tab_webtoon_view, text="🎨 Roteiro de Webtoon")
         sub_notebook.add(tab_biblia_view, text="🏛️ Bíblia de Personagens & Cenários")
+        sub_notebook.add(tab_podcast_view, text="🎙️ Show Notes & Capítulos")
+        sub_notebook.add(tab_clips_view, text="🎬 Cortes Virais (Shorts/TikTok)")
+        sub_notebook.add(tab_dados_view, text="🎲 Dados & Combate")
+        sub_notebook.add(tab_grafo_view, text="🗺️ Grafo de Lore & Fações")
 
         self.txt_transcricao = scrolledtext.ScrolledText(tab_trans_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Consolas", 10), wrap="word")
         self.txt_transcricao.pack(fill="both", expand=True, padx=4, pady=4)
@@ -2641,6 +2791,18 @@ class RPGChroniclerApp:
         self.txt_biblia = scrolledtext.ScrolledText(tab_biblia_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Georgia", 10), wrap="word")
         self.txt_biblia.pack(fill="both", expand=True, padx=4, pady=4)
 
+        self.txt_podcast = scrolledtext.ScrolledText(tab_podcast_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Consolas", 10), wrap="word")
+        self.txt_podcast.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.txt_clips = scrolledtext.ScrolledText(tab_clips_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Consolas", 10), wrap="word")
+        self.txt_clips.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.txt_dados = scrolledtext.ScrolledText(tab_dados_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Consolas", 10), wrap="word")
+        self.txt_dados.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.txt_grafo = scrolledtext.ScrolledText(tab_grafo_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Consolas", 10), wrap="word")
+        self.txt_grafo.pack(fill="both", expand=True, padx=4, pady=4)
+
         # Carrega a bíblia existente
         biblia_file = BASE_DIR / "biblia_personagens_e_cenarios.md"
         if biblia_file.exists():
@@ -2654,12 +2816,81 @@ class RPGChroniclerApp:
         self.btn_ai_generate = tk.Button(f_exp, text="✨ Gerar Diário & Histórias com IA", font=("Segoe UI", 10, "bold"), bg=self.colors["gold"], fg="#000000", relief="flat", cursor="hand2", padx=10, pady=4, command=self.start_ai_generation_only)
         self.btn_ai_generate.pack(side="left", padx=5)
         tk.Button(f_exp, text="💾 Salvar Tudo (.md)", font=("Segoe UI", 10, "bold"), bg=self.colors["accent"], fg="#fff", relief="flat", padx=10, pady=4, command=self.export_markdown).pack(side="left", padx=5)
+        tk.Button(f_exp, text="🎙️ Masterizar Podcast", font=("Segoe UI", 9, "bold"), bg=self.colors["gold"], fg="#000", relief="flat", padx=8, pady=4, command=self.master_current_audio).pack(side="left", padx=5)
+        tk.Button(f_exp, text="🎬 Gerar Cortes MP4", font=("Segoe UI", 9, "bold"), bg=self.colors["accent_bright"], fg="#fff", relief="flat", padx=8, pady=4, command=self.render_viral_clip_videos).pack(side="left", padx=5)
         self.btn_cancel_job = tk.Button(f_exp, text="⏹ Cancelar", font=("Segoe UI", 9, "bold"), bg=self.colors["crimson"], fg="#fff", relief="flat", padx=8, pady=4, state="disabled", command=self.cancel_processing)
         self.btn_cancel_job.pack(side="left", padx=5)
         self.btn_apply_bible = tk.Button(f_exp, text="✅ Aprovar Bíblia", font=("Segoe UI", 9, "bold"), bg=self.colors["emerald"], fg="#fff", relief="flat", padx=8, pady=4, state="disabled", command=self.apply_bible_proposal)
         self.btn_apply_bible.pack(side="left", padx=5)
-        tk.Button(f_exp, text="📚 Copiar Light Novel", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=8, pady=4, command=lambda: self.copy_to_clipboard(self.txt_novel.get("1.0", "end"))).pack(side="left", padx=5)
-        tk.Button(f_exp, text="🎨 Copiar Roteiro Webtoon", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=8, pady=4, command=lambda: self.copy_to_clipboard(self.txt_webtoon.get("1.0", "end"))).pack(side="left", padx=5)
+        tk.Button(f_exp, text="📚 Copiar Novel", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=8, pady=4, command=lambda: self.copy_to_clipboard(self.txt_novel.get("1.0", "end"))).pack(side="left", padx=5)
+        tk.Button(f_exp, text="🎨 Copiar Webtoon", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=8, pady=4, command=lambda: self.copy_to_clipboard(self.txt_webtoon.get("1.0", "end"))).pack(side="left", padx=5)
+
+    def _update_podcast_view(self, content):
+        self.txt_podcast.delete("1.0", "end")
+        self.txt_podcast.insert("1.0", content)
+
+    def _update_clips_view(self, content):
+        self.txt_clips.delete("1.0", "end")
+        self.txt_clips.insert("1.0", content)
+
+    def _update_dados_view(self, content):
+        self.txt_dados.delete("1.0", "end")
+        self.txt_dados.insert("1.0", content)
+
+    def _update_grafo_view(self, content):
+        self.txt_grafo.delete("1.0", "end")
+        self.txt_grafo.insert("1.0", content)
+
+    def master_current_audio(self):
+        if not self.last_audio_file or not Path(self.last_audio_file).exists():
+            messagebox.showwarning("Sem Áudio", "Carregue ou grave um áudio primeiro.")
+            return
+        def _task():
+            try:
+                self.update_ui_progress(50, "🎙️ Masterizando Áudio (EBU R128)...", "Aplicando EQ 4-Bandas, De-Esser e Normalização -16 LUFS...", color=self.colors["gold"])
+                engineer = PodcastAudioEngineerAgent(target_lufs=-16.0, enable_conference_mode=True)
+                out_path = Path(self.last_audio_file).parent / f"{Path(self.last_audio_file).stem}_podcast_master.wav"
+                report = engineer.process(self.last_audio_file, output_path=out_path)
+                self.update_ui_progress(100, "🎉 Masterização Concluída", f"Salvo em: {out_path.name}", color=self.colors["emerald"])
+                msg = f"Áudio masterizado com sucesso!\n\nArquivo: {out_path}\nLUFS Inicial: {report['initial_lufs']}\nLUFS Final: {report['final_lufs']}\nTrue Peak: {report['final_peak_db']} dBFS"
+                self.root.after(0, lambda: messagebox.showinfo("Masterização Concluída", msg))
+            except Exception as e:
+                self.update_ui_progress(0, "Erro na masterização", str(e), color=self.colors["crimson"])
+                self.root.after(0, lambda: messagebox.showerror("Erro", str(e)))
+        threading.Thread(target=_task, daemon=True).start()
+
+    def render_viral_clip_videos(self):
+        if not self.last_audio_file or not Path(self.last_audio_file).exists():
+            messagebox.showwarning("Sem Áudio", "Carregue ou grave um áudio primeiro.")
+            return
+
+        segments = getattr(self, "last_segments", [])
+        if not segments:
+            messagebox.showwarning("Sem Cortes", "Processe a sessão primeiro para detectar os trechos virais.")
+            return
+
+        def _task():
+            try:
+                self.update_ui_progress(30, "🎬 Curando Cortes Virais...", "Minerando picos dramáticos de 30 a 90 segundos...", color=self.colors["gold"])
+                scout = SocialClipsViralScoutAgent()
+                clips = scout.extract_clips(segments, max_clips=5)
+                if not clips:
+                    self.update_ui_progress(100, "Sem Cortes", "Nenhum trecho com duração suficiente encontrado.", color=self.colors["text_muted"])
+                    return
+
+                self.update_ui_progress(60, "🎬 Renderizando Vídeos 9:16 (MP4)...", "Criando audiogramas e sincronizando ganchos para Shorts/TikTok...", color=self.colors["gold"])
+                video_agent = VideoClipGeneratorAgent()
+                out_dir = Path(self.last_audio_file).parent / "cortes_virais"
+                rendered = video_agent.render_all_clips(self.last_audio_file, clips, out_dir)
+
+                self.update_ui_progress(100, "🎉 Cortes Renderizados", f"{len(rendered)} vídeos gerados em cortes_virais/", color=self.colors["emerald"])
+                msg = f"{len(rendered)} cortes virais gerados com sucesso!\n\nPasta: {out_dir}\nProntos para publicação no TikTok, Reels e Shorts."
+                self.root.after(0, lambda: messagebox.showinfo("Cortes Renderizados", msg))
+            except Exception as e:
+                self.update_ui_progress(0, "Erro ao renderizar vídeos", str(e), color=self.colors["crimson"])
+                self.root.after(0, lambda: messagebox.showerror("Erro", str(e)))
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def copy_to_clipboard(self, text):
         self.root.clipboard_clear()
@@ -2695,6 +2926,18 @@ class RPGChroniclerApp:
             content += self.txt_transcricao.get("1.0", "end").strip() + "\n\n---\n\n"
             content += "## 🏛️ 5. Bíblia de Continuidade em revisão\n\n"
             content += self.txt_biblia.get("1.0", "end").strip() + "\n"
+            if hasattr(self, "txt_podcast") and self.txt_podcast.get("1.0", "end").strip():
+                content += "\n\n---\n\n## 🎙️ 6. Show Notes & Capítulos do Episódio\n\n"
+                content += self.txt_podcast.get("1.0", "end").strip() + "\n"
+            if hasattr(self, "txt_clips") and self.txt_clips.get("1.0", "end").strip():
+                content += "\n\n---\n\n## 🎬 7. Melhores Cortes para Redes Sociais\n\n"
+                content += self.txt_clips.get("1.0", "end").strip() + "\n"
+            if hasattr(self, "txt_dados") and self.txt_dados.get("1.0", "end").strip():
+                content += "\n\n---\n\n## 🎲 8. Dados & Relatório Tático de Combate\n\n"
+                content += self.txt_dados.get("1.0", "end").strip() + "\n"
+            if hasattr(self, "txt_grafo") and self.txt_grafo.get("1.0", "end").strip():
+                content += "\n\n---\n\n## 🗺️ 9. Grafo de Lore, Fações & Relacionamentos\n\n```mermaid\n"
+                content += self.txt_grafo.get("1.0", "end").strip() + "\n```\n"
             try:
                 atomic_write_text(file_path, content)
             except Exception as exc:
@@ -2932,22 +3175,49 @@ class RPGChroniclerApp:
                 self.txt_transcricao.insert("1.0", "--- 🎙️ TRANSCRIÇÃO EM TEMPO REAL ---\n\n")
             self.root.after(0, _prep_trans)
 
+            # Prompt bias da Bíblia de campanha (NPCs, lugares, facções e termos técnicos de RPG)
+            initial_prompt_text = "Sessão de RPG. Use somente participantes, personagens e termos fornecidos pelo usuário."
+            biblia_file = BASE_DIR / "biblia_personagens_e_cenarios.md"
+            if biblia_file.exists():
+                try:
+                    bible_content = biblia_file.read_text(encoding="utf-8")
+                    prompt_bias = build_whisper_prompt_bias(bible_content, max_words=120)
+                    if prompt_bias:
+                        initial_prompt_text = prompt_bias
+                except Exception as e_bias:
+                    print(f"[Whisper] Aviso ao gerar prompt bias da bíblia: {e_bias}")
+
             try:
                 segments_raw, info = engine.transcribe(
                     audio_path,
                     beam_size=5,
                     language="pt",
-                    initial_prompt="Sessão de RPG. Use somente participantes, personagens e termos fornecidos pelo usuário."
+                    word_timestamps=True,
+                    initial_prompt=initial_prompt_text
                 )
                 total_duration = getattr(info, 'duration', 1.0) or 1.0
                 segments = []
                 for seg in segments_raw:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Processamento cancelado pelo usuário.")
+                    words = []
+                    if hasattr(seg, "words") and seg.words:
+                        for w in seg.words:
+                            w_word = getattr(w, "word", "")
+                            if w_word:
+                                words.append({
+                                    "word": w_word.strip(),
+                                    "start": float(getattr(w, "start", 0.0)),
+                                    "end": float(getattr(w, "end", 0.0)),
+                                    "probability": float(getattr(w, "probability", 1.0)),
+                                })
+                    raw_text = seg.text.strip()
+                    norm_text = normalize_rpg_transcript_mechanics(raw_text)
                     segments.append({
                         "start": seg.start,
                         "end": seg.end,
-                        "text": seg.text.strip()
+                        "text": norm_text,
+                        "words": words,
                     })
                     pct = min(30, int((seg.end / max(1.0, total_duration)) * 30))
                     current_time = format_timestamp(seg.end, decimal='.')[:8]
@@ -2955,7 +3225,7 @@ class RPGChroniclerApp:
                     sub = f"Progresso do Áudio: {current_time} / {total_time} • {len(segments)} falas capturadas"
                     self.update_ui_progress(pct, f"🎙️ [1/6] Transcrevendo Áudio ({int((seg.end / max(1.0, total_duration)) * 100)}%)", sub, color=self.colors["gold"])
                     
-                    line_txt = f"[{format_timestamp(seg.start, decimal='.')[:8]} -> {current_time}]: {seg.text.strip()}\n"
+                    line_txt = f"[{format_timestamp(seg.start, decimal='.')[:8]} -> {current_time}]: {norm_text}\n"
                     def _append_seg(lt=line_txt):
                         self.txt_transcricao.insert("end", lt)
                         self.txt_transcricao.see("end")
@@ -2969,17 +3239,32 @@ class RPGChroniclerApp:
                     audio_path,
                     beam_size=5,
                     language="pt",
-                    initial_prompt="Sessão de RPG. Use somente participantes, personagens e termos fornecidos pelo usuário."
+                    word_timestamps=True,
+                    initial_prompt=initial_prompt_text
                 )
                 total_duration = getattr(info, 'duration', 1.0) or 1.0
                 segments = []
                 for seg in segments_raw:
                     if self.cancel_event.is_set():
                         raise InterruptedError("Processamento cancelado pelo usuário.")
+                    words = []
+                    if hasattr(seg, "words") and seg.words:
+                        for w in seg.words:
+                            w_word = getattr(w, "word", "")
+                            if w_word:
+                                words.append({
+                                    "word": w_word.strip(),
+                                    "start": float(getattr(w, "start", 0.0)),
+                                    "end": float(getattr(w, "end", 0.0)),
+                                    "probability": float(getattr(w, "probability", 1.0)),
+                                })
+                    raw_text = seg.text.strip()
+                    norm_text = normalize_rpg_transcript_mechanics(raw_text)
                     segments.append({
                         "start": seg.start,
                         "end": seg.end,
-                        "text": seg.text.strip()
+                        "text": norm_text,
+                        "words": words,
                     })
                     pct = min(30, int((seg.end / max(1.0, total_duration)) * 30))
                     current_time = format_timestamp(seg.end, decimal='.')[:8]
@@ -2987,7 +3272,7 @@ class RPGChroniclerApp:
                     sub = f"Progresso do Áudio: {current_time} / {total_time} • {len(segments)} falas capturadas"
                     self.update_ui_progress(pct, f"🎙️ [1/6] Transcrevendo Áudio ({int((seg.end / max(1.0, total_duration)) * 100)}%)", sub, color=self.colors["gold"])
                     
-                    line_txt = f"[{format_timestamp(seg.start, decimal='.')[:8]} -> {current_time}]: {seg.text.strip()}\n"
+                    line_txt = f"[{format_timestamp(seg.start, decimal='.')[:8]} -> {current_time}]: {norm_text}\n"
                     def _append_seg(lt=line_txt):
                         self.txt_transcricao.insert("end", lt)
                         self.txt_transcricao.see("end")
@@ -3517,6 +3802,44 @@ Sua missão é ATUALIZAR a Bíblia de Produção com todas as novas informaçõe
             self.root.after(0, _update_biblia)
 
             self.root.after(0, lambda: self.btn_apply_bible.config(state="normal"))
+
+            # 8. Execução dos Agentes Especialistas de Audiovisual e Podcast
+            try:
+                self.update_ui_progress(95, "🎙️ Agentes Audiovisuais & Podcast...", "Masterizando áudio (EBU R128), gerando Show Notes e cortes virais...", color=self.colors["gold"])
+                spec_audio = options.get("audio_path") or self.last_audio_file
+                spec_segments = []
+                if run and (run.directory / "transcript.json").exists():
+                    try:
+                        with open(run.directory / "transcript.json", "r", encoding="utf-8") as tf:
+                            spec_segments = json.load(tf).get("segments", [])
+                    except Exception:
+                        pass
+
+                run_dir = run.directory if run else RUNS_DIR / f"run-{datetime.now():%Y%m%d-%H%M%S}"
+                spec_results = run_all_runtime_specialists(
+                    audio_path=spec_audio,
+                    segments=spec_segments,
+                    campaign_options=options,
+                    run_directory=run_dir,
+                )
+                if run:
+                    run.mark_stage("specialists_audiovisual", "completed", results=spec_results)
+
+                if hasattr(self, "txt_podcast") and (run_dir / "show_notes.md").exists():
+                    notes_content = (run_dir / "show_notes.md").read_text(encoding="utf-8")
+                    self.root.after(0, lambda c=notes_content: self._update_podcast_view(c))
+                if hasattr(self, "txt_clips") and (run_dir / "viral_clips.md").exists():
+                    clips_content = (run_dir / "viral_clips.md").read_text(encoding="utf-8")
+                    self.root.after(0, lambda c=clips_content: self._update_clips_view(c))
+                if hasattr(self, "txt_dados") and (run_dir / "combat_stats.md").exists():
+                    dados_content = (run_dir / "combat_stats.md").read_text(encoding="utf-8")
+                    self.root.after(0, lambda c=dados_content: self._update_dados_view(c))
+                if hasattr(self, "txt_grafo") and (run_dir / "lore_graph.mmd").exists():
+                    grafo_content = (run_dir / "lore_graph.mmd").read_text(encoding="utf-8")
+                    self.root.after(0, lambda c=grafo_content: self._update_grafo_view(c))
+            except Exception as exc_spec:
+                LOGGER.warning("[Agentes] Erro na execução dos especialistas: %s", exc_spec)
+
             if run:
                 run.finish()
 
