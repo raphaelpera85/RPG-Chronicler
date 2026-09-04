@@ -39,3 +39,10 @@
 ## 10. Phonetic & Mechanical Normalization
 - Conversational dice expressions and RPG jargon (e.g. "um d 20", "20 natural", "classe de armadura") must be normalized into standard RPG notation ("1d20", "20 natural", "CA", "PV", "CD") immediately following transcription to optimize downstream NLP, lore graph extraction, and search indexing.
 
+## 11. Passive Audio Monitoring & Resilient Hardware Probing
+- Audio device enumeration must be resilient against missing host APIs or faulty sound drivers; always query with protective fallbacks.
+- Microphone monitoring before recording must run in lightweight passive streams that calculate RMS volume for visual meters without allocating queue buffers or disk writers, and must be terminated cleanly before full recording begins.
+
+## 12. Self-Contained Offline Publishing Bundles
+- Session exports (ZIP bundles) must be standalone and self-contained, including responsive HTML portals (`index.html`), interactive relationship graphs, subtitles (`.srt`, `.vtt`, `.ass`), and audio, enabling players to consume campaign content locally without needing Python or external server installations.
+

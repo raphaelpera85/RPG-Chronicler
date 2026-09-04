@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
+import webbrowser
 
 # Configuração de DLLs CUDA / NVIDIA no Windows
 if sys.platform == "win32":
@@ -89,6 +90,11 @@ from rpg_chronicler_core import (
     apply_auto_ducking,
     apply_cross_bleed_cancellation,
     acting_invariant_feature_distance,
+    list_audio_input_devices,
+    play_audio_slice,
+    generate_interactive_lore_graph_html,
+    export_session_publishing_bundle,
+    detect_ollama_local_models,
 )
 from agents import (
     PodcastAudioEngineerAgent,
@@ -1355,6 +1361,9 @@ class AudioRecorder:
         self.enable_conference_mode = enable_conference_mode
         self.is_recording = False
         self.is_paused = False
+        self.is_monitoring = False
+        self.monitoring_stream = None
+        self.last_device_idx = None
         self.audio_queue = queue.Queue()
         self.stream = None
         self.writer_thread = None
@@ -1366,16 +1375,43 @@ class AudioRecorder:
         self.writer_error = None
 
     def callback(self, indata, frames, time_info, status):
+        rms = float(np.sqrt(np.mean(indata**2)))
+        self.current_volume = rms
         if self.is_recording and not self.is_paused:
             self.audio_queue.put(indata.copy())
-            rms = np.sqrt(np.mean(indata**2))
-            self.current_volume = float(rms)
-        else:
-            self.current_volume = 0.0
+
+    def start_monitoring(self, device_idx=None):
+        if self.is_recording:
+            return
+        self.stop_monitoring()
+        self.last_device_idx = device_idx
+        try:
+            self.monitoring_stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                device=device_idx,
+                callback=self.callback
+            )
+            self.monitoring_stream.start()
+            self.is_monitoring = True
+        except Exception:
+            self.is_monitoring = False
+
+    def stop_monitoring(self):
+        if getattr(self, "monitoring_stream", None):
+            try:
+                self.monitoring_stream.stop()
+                self.monitoring_stream.close()
+            except Exception:
+                pass
+            self.monitoring_stream = None
+        self.is_monitoring = False
 
     def start(self, device_idx=None):
         if self.is_recording:
             raise RuntimeError("Já existe uma gravação em andamento.")
+        self.stop_monitoring()
+        self.last_device_idx = device_idx
         self.audio_queue = queue.Queue()
         self.frames_written = 0
         self.writer_error = None
@@ -1735,18 +1771,19 @@ class RPGChroniclerApp:
         dev_card = tk.LabelFrame(container, text=" Dispositivo de Microfone / Entrada ", font=("Segoe UI", 10, "bold"), fg=self.colors["gold"], bg=self.colors["card_bg"], padx=15, pady=10)
         dev_card.pack(fill="x", pady=(0, 15))
 
-        self.devices_list = []
-        try:
-            for idx, dev in enumerate(sd.query_devices()):
-                if dev['max_input_channels'] > 0:
-                    self.devices_list.append(f"{idx}: {dev['name']}")
-        except Exception:
-            self.devices_list = ["0: Microfone Padrão"]
+        f_dev_row = tk.Frame(dev_card, bg=self.colors["card_bg"])
+        f_dev_row.pack(fill="x", pady=4)
 
-        self.dev_combo = ttk.Combobox(dev_card, values=self.devices_list, state="readonly", font=("Segoe UI", 10))
-        if self.devices_list:
-            self.dev_combo.current(0)
-        self.dev_combo.pack(fill="x", pady=4)
+        self.dev_combo = ttk.Combobox(f_dev_row, state="readonly", font=("Segoe UI", 10))
+        self.dev_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self.btn_refresh_devs = tk.Button(f_dev_row, text="🔄 Recarregar", font=("Segoe UI", 9, "bold"), bg="#30363d", fg="#ffffff", relief="flat", cursor="hand2", padx=8, pady=2, command=self.reload_audio_devices)
+        self.btn_refresh_devs.pack(side="left", padx=(0, 6))
+
+        self.btn_monitor_dev = tk.Button(f_dev_row, text="🎙️ Testar Entrada", font=("Segoe UI", 9, "bold"), bg=self.colors["accent"], fg="#ffffff", relief="flat", cursor="hand2", padx=8, pady=2, command=self.toggle_audio_monitoring)
+        self.btn_monitor_dev.pack(side="left")
+
+        self.reload_audio_devices()
 
         rec_card = tk.LabelFrame(container, text=" Mesa de Gravação ao Vivo ", font=("Segoe UI", 11, "bold"), fg=self.colors["accent_bright"], bg=self.colors["card_bg"], padx=20, pady=20)
         rec_card.pack(fill="both", expand=True)
@@ -1848,8 +1885,39 @@ class RPGChroniclerApp:
         )
         chk_calib.pack(pady=(12, 0))
 
+    def reload_audio_devices(self):
+        devices = list_audio_input_devices(sd)
+        self.devices_list = [d["display"] for d in devices]
+        if not self.devices_list:
+            self.devices_list = ["0: Microfone Padrão"]
+        self.dev_combo["values"] = self.devices_list
+        default_idx = 0
+        for i, d in enumerate(devices):
+            if d.get("is_default"):
+                default_idx = i
+                break
+        self.dev_combo.current(default_idx)
+
+    def toggle_audio_monitoring(self):
+        if self.recorder.is_recording:
+            return
+        if getattr(self.recorder, "is_monitoring", False):
+            self.recorder.stop_monitoring()
+            self.btn_monitor_dev.config(text="🎙️ Testar Entrada", bg=self.colors["accent"])
+            self.status_recording_label.config(text="Monitoramento finalizado", fg=self.colors["text_muted"])
+        else:
+            dev_str = self.dev_combo.get()
+            dev_idx = int(dev_str.split(":")[0]) if ":" in dev_str else None
+            self.recorder.start_monitoring(device_idx=dev_idx)
+            self.btn_monitor_dev.config(text="⏹️ Parar Teste", bg=self.colors["crimson"])
+            self.status_recording_label.config(text="🎙️ Monitorando microfone ao vivo... Fale para testar o VU Meter", fg=self.colors["gold"])
+
     def toggle_recording(self):
         if not self.recorder.is_recording:
+            if getattr(self.recorder, "is_monitoring", False):
+                self.recorder.stop_monitoring()
+                if hasattr(self, "btn_monitor_dev"):
+                    self.btn_monitor_dev.config(text="🎙️ Testar Entrada", bg=self.colors["accent"])
             dev_str = self.dev_combo.get()
             dev_idx = int(dev_str.split(":")[0]) if ":" in dev_str else None
             self.recorder.enable_denoise = bool(self.noise_suppression_var.get()) if hasattr(self, "noise_suppression_var") else True
@@ -1898,15 +1966,30 @@ class RPGChroniclerApp:
             self.timer_label.config(text=f"{hrs:02d}:{mins:02d}:{secs:02d}")
         
         if hasattr(self, 'vu_canvas'):
-            vol = min(1.0, self.recorder.current_volume * 15)
-            w = self.vu_canvas.winfo_width()
+            # Converte volume RMS para escala perceptiva suave
+            vol = min(1.0, float(np.sqrt(max(0.0, self.recorder.current_volume)) * 3.8))
+            w = max(100, self.vu_canvas.winfo_width())
+            h = 12
             self.vu_canvas.delete("all")
-            fill_w = int(w * vol)
-            if fill_w > 0:
-                color = self.colors["emerald"] if vol < 0.7 else self.colors["crimson"]
-                self.vu_canvas.create_rectangle(0, 0, fill_w, 12, fill=color, outline="")
+            num_segments = 28
+            gap = 2
+            seg_w = max(2, (w - (num_segments - 1) * gap) // num_segments)
+            for i in range(num_segments):
+                pos = (i + 1) / num_segments
+                x0 = i * (seg_w + gap)
+                x1 = x0 + seg_w
+                if vol >= pos:
+                    if pos < 0.65:
+                        seg_color = "#2ea043"  # Verde seguro
+                    elif pos < 0.88:
+                        seg_color = "#d29922"  # Âmbar atenção
+                    else:
+                        seg_color = "#f85149"  # Vermelho pico/clip
+                else:
+                    seg_color = "#21262d"  # Segmento LED desligado
+                self.vu_canvas.create_rectangle(x0, 1, x1, h - 1, fill=seg_color, outline="")
 
-        self.root.after(100, self.update_timer_loop)
+        self.root.after(80, self.update_timer_loop)
 
     # ==================== ABA 2: MESA & PARTICIPANTES ====================
     def setup_tab_participantes(self):
@@ -2448,17 +2531,31 @@ class RPGChroniclerApp:
 
         btn_local = tk.Button(
             f_presets,
-            text="💻 LM Studio Local (100% Offline)",
+            text="💻 LM Studio (Offline)",
             font=("Segoe UI", 9, "bold"),
             bg="#374151",
             fg="#ffffff",
             relief="flat",
             cursor="hand2",
-            padx=10,
+            padx=8,
             pady=4,
             command=self.apply_lmstudio_preset
         )
-        btn_local.pack(side="left")
+        btn_local.pack(side="left", padx=(0, 6))
+
+        btn_ollama = tk.Button(
+            f_presets,
+            text="🦙 Ollama (Offline)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1f2937",
+            fg="#ffffff",
+            relief="flat",
+            cursor="hand2",
+            padx=8,
+            pady=4,
+            command=self.apply_ollama_preset
+        )
+        btn_ollama.pack(side="left")
 
         f_url = tk.Frame(card_lm, bg=self.colors["card_bg"])
         f_url.pack(fill="x", pady=4)
@@ -2592,6 +2689,26 @@ class RPGChroniclerApp:
         self.lm_key_entry.delete(0, "end")
         self.save_config()
         self.update_model_access_label()
+        self.start_connection_check()
+
+    def apply_ollama_preset(self):
+        self.lm_url_entry.delete(0, "end")
+        self.lm_url_entry.insert(0, "http://localhost:11434/v1")
+        self.lm_key_entry.delete(0, "end")
+        self.lm_key_entry.insert(0, "ollama")
+        models = detect_ollama_local_models("http://localhost:11434")
+        if models:
+            self.lm_model_combo["values"] = models
+            self.lm_model_combo.set(models[0])
+            self.save_config()
+            self.update_model_access_label()
+            messagebox.showinfo("Ollama Conectado", f"Modelos locais detectados no Ollama:\n" + "\n".join(f"• {m}" for m in models[:6]))
+        else:
+            self.lm_model_combo["values"] = ["llama3:8b", "mistral:7b", "qwen2.5:7b"]
+            self.lm_model_combo.set("llama3:8b")
+            self.save_config()
+            self.update_model_access_label()
+            messagebox.showinfo("Preset Ollama Aplicado", "Endpoint configurado para http://localhost:11434/v1.\nCertifique-se de que o daemon do Ollama está rodando ('ollama serve').")
         self.start_connection_check()
 
     def toggle_api_key_visibility(self):
@@ -2778,6 +2895,12 @@ class RPGChroniclerApp:
 
         self.txt_transcricao = scrolledtext.ScrolledText(tab_trans_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Consolas", 10), wrap="word")
         self.txt_transcricao.pack(fill="both", expand=True, padx=4, pady=4)
+        self.txt_transcricao.bind("<Double-Button-1>", self.on_transcription_double_click)
+        self.txt_transcricao.bind("<Button-3>", self.show_transcription_context_menu)
+
+        self.transcription_menu = tk.Menu(self.root, tearoff=0, bg=self.colors["card_bg"], fg=self.colors["text"], activebackground=self.colors["accent"], activeforeground="#ffffff")
+        self.transcription_menu.add_command(label="▶️ Reproduzir Este Trecho de Áudio", command=self.play_selected_transcription_line)
+        self.transcription_menu.add_command(label="📋 Copiar Linha", command=lambda: self.copy_to_clipboard(self.txt_transcricao.get("insert linestart", "insert lineend")))
 
         self.txt_resumo = scrolledtext.ScrolledText(tab_resumo_view, bg=self.colors["entry_bg"], fg=self.colors["text"], insertbackground=self.colors["text"], font=("Georgia", 11), wrap="word")
         self.txt_resumo.pack(fill="both", expand=True, padx=4, pady=4)
@@ -2815,15 +2938,17 @@ class RPGChroniclerApp:
         f_exp.pack(fill="x", pady=(10, 0))
         self.btn_ai_generate = tk.Button(f_exp, text="✨ Gerar Diário & Histórias com IA", font=("Segoe UI", 10, "bold"), bg=self.colors["gold"], fg="#000000", relief="flat", cursor="hand2", padx=10, pady=4, command=self.start_ai_generation_only)
         self.btn_ai_generate.pack(side="left", padx=5)
-        tk.Button(f_exp, text="💾 Salvar Tudo (.md)", font=("Segoe UI", 10, "bold"), bg=self.colors["accent"], fg="#fff", relief="flat", padx=10, pady=4, command=self.export_markdown).pack(side="left", padx=5)
-        tk.Button(f_exp, text="🎙️ Masterizar Podcast", font=("Segoe UI", 9, "bold"), bg=self.colors["gold"], fg="#000", relief="flat", padx=8, pady=4, command=self.master_current_audio).pack(side="left", padx=5)
-        tk.Button(f_exp, text="🎬 Gerar Cortes MP4", font=("Segoe UI", 9, "bold"), bg=self.colors["accent_bright"], fg="#fff", relief="flat", padx=8, pady=4, command=self.render_viral_clip_videos).pack(side="left", padx=5)
+        tk.Button(f_exp, text="💾 Salvar (.md)", font=("Segoe UI", 10, "bold"), bg=self.colors["accent"], fg="#fff", relief="flat", padx=8, pady=4, command=self.export_markdown).pack(side="left", padx=5)
+        tk.Button(f_exp, text="🎙️ Masterizar", font=("Segoe UI", 9, "bold"), bg=self.colors["gold"], fg="#000", relief="flat", padx=8, pady=4, command=self.master_current_audio).pack(side="left", padx=5)
+        tk.Button(f_exp, text="🎬 Cortes MP4", font=("Segoe UI", 9, "bold"), bg=self.colors["accent_bright"], fg="#fff", relief="flat", padx=8, pady=4, command=self.render_viral_clip_videos).pack(side="left", padx=5)
+        tk.Button(f_exp, text="🌐 Grafo Interativo HTML", font=("Segoe UI", 9, "bold"), bg="#8b5cf6", fg="#fff", relief="flat", padx=8, pady=4, command=self.open_interactive_lore_graph).pack(side="left", padx=5)
+        tk.Button(f_exp, text="📦 Pacote ZIP", font=("Segoe UI", 9, "bold"), bg=self.colors["emerald"], fg="#fff", relief="flat", padx=8, pady=4, command=self.export_publishing_bundle).pack(side="left", padx=5)
         self.btn_cancel_job = tk.Button(f_exp, text="⏹ Cancelar", font=("Segoe UI", 9, "bold"), bg=self.colors["crimson"], fg="#fff", relief="flat", padx=8, pady=4, state="disabled", command=self.cancel_processing)
         self.btn_cancel_job.pack(side="left", padx=5)
         self.btn_apply_bible = tk.Button(f_exp, text="✅ Aprovar Bíblia", font=("Segoe UI", 9, "bold"), bg=self.colors["emerald"], fg="#fff", relief="flat", padx=8, pady=4, state="disabled", command=self.apply_bible_proposal)
         self.btn_apply_bible.pack(side="left", padx=5)
-        tk.Button(f_exp, text="📚 Copiar Novel", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=8, pady=4, command=lambda: self.copy_to_clipboard(self.txt_novel.get("1.0", "end"))).pack(side="left", padx=5)
-        tk.Button(f_exp, text="🎨 Copiar Webtoon", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=8, pady=4, command=lambda: self.copy_to_clipboard(self.txt_webtoon.get("1.0", "end"))).pack(side="left", padx=5)
+        tk.Button(f_exp, text="📚 Copiar Novel", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=6, pady=4, command=lambda: self.copy_to_clipboard(self.txt_novel.get("1.0", "end"))).pack(side="left", padx=4)
+        tk.Button(f_exp, text="🎨 Copiar Webtoon", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=6, pady=4, command=lambda: self.copy_to_clipboard(self.txt_webtoon.get("1.0", "end"))).pack(side="left", padx=4)
 
     def _update_podcast_view(self, content):
         self.txt_podcast.delete("1.0", "end")
@@ -2945,6 +3070,141 @@ class RPGChroniclerApp:
                 messagebox.showerror("Falha na exportação", str(exc))
                 return
             messagebox.showinfo("Exportado com Sucesso", f"Todos os materiais foram salvos em:\n{file_path}")
+
+    def on_transcription_double_click(self, event=None):
+        self.play_selected_transcription_line()
+
+    def show_transcription_context_menu(self, event):
+        try:
+            self.txt_transcricao.mark_set("insert", f"@{event.x},{event.y}")
+            self.transcription_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.transcription_menu.grab_release()
+
+    def play_selected_transcription_line(self):
+        try:
+            line_text = self.txt_transcricao.get("insert linestart", "insert lineend").strip()
+            if not line_text:
+                return
+            import re
+            m = re.search(r"\[(\d{1,2}):(\d{2}):(\d{2})(?:\.\d+)?\s*->\s*(\d{1,2}):(\d{2}):(\d{2})(?:\.\d+)?\]", line_text)
+            if not m:
+                m_short = re.search(r"\[(\d{1,2}):(\d{2})\s*->\s*(\d{1,2}):(\d{2})\]", line_text)
+                if m_short:
+                    start_sec = int(m_short.group(1)) * 60 + int(m_short.group(2))
+                    end_sec = int(m_short.group(3)) * 60 + int(m_short.group(4))
+                else:
+                    messagebox.showinfo("Reprodução de Trecho", "Nenhum timestamp [00:00:00 -> 00:00:00] encontrado nesta linha.")
+                    return
+            else:
+                start_sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                end_sec = int(m.group(4)) * 3600 + int(m.group(5)) * 60 + int(m.group(6))
+
+            audio_cand = getattr(self, "last_audio_file", None)
+            if not audio_cand or not Path(audio_cand).exists():
+                camp = self.campanha_entry.get().strip().replace(" ", "_")
+                sess = self.sessao_entry.get().strip().replace(" ", "_")
+                p1 = AUDIO_DIR / f"{camp}_{sess}.wav"
+                p2 = AUDIO_DIR / f"{camp}_{sess}_podcast_master.wav"
+                if p2.exists():
+                    audio_cand = p2
+                elif p1.exists():
+                    audio_cand = p1
+                else:
+                    wavs = sorted(AUDIO_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if wavs:
+                        audio_cand = wavs[0]
+
+            if not audio_cand or not Path(audio_cand).exists():
+                messagebox.showwarning("Áudio não encontrado", "Grave ou carregue uma sessão de áudio para ouvir o trecho.")
+                return
+
+            self.lbl_subprogress.config(
+                text=f"▶️ Reproduzindo trecho ({start_sec}s até {end_sec}s)...",
+                fg=self.colors["gold"]
+            )
+            success = play_audio_slice(audio_cand, start_sec, end_sec, sd_module=sd, block=False)
+            if not success:
+                messagebox.showerror("Erro de Reprodução", "Não foi possível reproduzir a fatia do áudio selecionado.")
+        except Exception as exc:
+            messagebox.showerror("Erro de Reprodução", f"Falha ao reproduzir trecho: {exc}")
+
+    def open_interactive_lore_graph(self):
+        try:
+            campanha = self.campanha_entry.get().strip() or "Campanha RPG"
+            mermaid_code = self.txt_grafo.get("1.0", "end").strip()
+            graph_dict = getattr(self, "last_graph_dict", None)
+            
+            if not graph_dict:
+                graph_dict = {
+                    "factions": ["Ordem dos Guardiões", "Guilda das Sombras", "Círculo dos Magos"],
+                    "characters": ["Narrador (Mestre)"],
+                    "locations": ["Taverna do Javali", "Cidadela Ancestral"],
+                    "relationships": []
+                }
+            
+            out_file = RUNS_DIR / f"grafo_interativo_{int(time.time())}.html"
+            generate_interactive_lore_graph_html(graph_dict, mermaid_code, campanha_name=campanha, output_path=out_file)
+            
+            self.lbl_subprogress.config(text=f"🌐 Grafo interativo aberto no navegador: {out_file.name}", fg=self.colors["emerald"])
+            webbrowser.open(str(out_file.resolve()))
+        except Exception as exc:
+            messagebox.showerror("Grafo Interativo", f"Falha ao gerar visualização do grafo: {exc}")
+
+    def export_publishing_bundle(self):
+        try:
+            campanha = self.campanha_entry.get().strip() or "Campanha RPG"
+            sessao = self.sessao_entry.get().strip() or "Sessão 01"
+            
+            default_name = f"{campanha}_{sessao}_Pacote_Publicacao.zip".replace(" ", "_")
+            out_zip = filedialog.asksaveasfilename(
+                defaultextension=".zip",
+                filetypes=[("Arquivo ZIP", "*.zip")],
+                initialfile=default_name,
+                title="Exportar Pacote Completo da Sessão"
+            )
+            if not out_zip:
+                return
+
+            bundle_dir = RUNS_DIR / f"bundle_{int(time.time())}"
+            bundle_dir.mkdir(exist_ok=True)
+
+            (bundle_dir / "transcricao.txt").write_text(self.txt_transcricao.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "diario_sessao.md").write_text(self.txt_resumo.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "capitulo_light_novel.md").write_text(self.txt_novel.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "roteiro_webtoon.md").write_text(self.txt_webtoon.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "biblia_lore.md").write_text(self.txt_biblia.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "show_notes_podcast.md").write_text(self.txt_podcast.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "cortes_virais.md").write_text(self.txt_clips.get("1.0", "end"), encoding="utf-8")
+            (bundle_dir / "combate_dados.md").write_text(self.txt_dados.get("1.0", "end"), encoding="utf-8")
+
+            audio_cand = getattr(self, "last_audio_file", None)
+            if audio_cand and Path(audio_cand).exists():
+                import shutil
+                shutil.copy2(audio_cand, bundle_dir / Path(audio_cand).name)
+
+            graph_dict = getattr(self, "last_graph_dict", None) or {"factions": [], "characters": [], "locations": [], "relationships": []}
+            mermaid_code = self.txt_grafo.get("1.0", "end").strip()
+            generate_interactive_lore_graph_html(
+                graph_dict=graph_dict,
+                mermaid_code=mermaid_code,
+                campanha_name=campanha,
+                output_path=bundle_dir / "grafo_lore.html"
+            )
+
+            campaign_info = {
+                "campanha": campanha,
+                "sessao": sessao,
+                "data": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            final_zip = export_session_publishing_bundle(bundle_dir, campaign_info=campaign_info, output_zip=out_zip)
+            messagebox.showinfo(
+                "Pacote Exportado com Sucesso",
+                f"Pacote completo da sessão criado em:\n{final_zip}\n\nInclui Portal Web 'index.html', transcrições, áudio, light novel, roteiros e grafo interativo!"
+            )
+        except Exception as exc:
+            messagebox.showerror("Erro ao Exportar Pacote", f"Falha ao criar arquivo ZIP de publicação: {exc}")
 
     def apply_bible_proposal(self):
         proposal = self.pending_bible_proposal

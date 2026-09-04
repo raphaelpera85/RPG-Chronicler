@@ -76,6 +76,11 @@ from rpg_chronicler_core import (
     apply_auto_ducking,
     apply_cross_bleed_cancellation,
     acting_invariant_feature_distance,
+    list_audio_input_devices,
+    play_audio_slice,
+    generate_interactive_lore_graph_html,
+    export_session_publishing_bundle,
+    detect_ollama_local_models,
 )
 from agents import (
     PodcastAudioEngineerAgent,
@@ -956,6 +961,166 @@ class RPGChroniclerTests(unittest.TestCase):
         sim = acting_tolerant_voice_similarity(feat_base, feat_acting, acting_weight=0.35)
         self.assertGreater(sim, 0.5)
         self.assertLessEqual(sim, 1.0)
+
+    def test_list_audio_input_devices(self):
+        class MockSoundDevice:
+            def query_devices(self):
+                return [
+                    {"name": "Speakers (Realtek)", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000},
+                    {"name": "Microphone (USB Audio)", "max_input_channels": 2, "max_output_channels": 0, "default_samplerate": 44100},
+                    {"name": "Line In", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000},
+                ]
+            def query_hostapis(self):
+                return [{"name": "MME"}, {"name": "Windows DirectSound"}]
+            def default_device_info(self):
+                return {"device": [1, 0]}
+            default = property(lambda self: type("DefaultDev", (), {"device": [1, 0]})())
+
+        mock_sd = MockSoundDevice()
+        devices = list_audio_input_devices(sd_module=mock_sd)
+        self.assertEqual(len(devices), 2)
+        self.assertEqual(devices[0]["index"], 1)
+        self.assertEqual(devices[0]["name"], "Microphone (USB Audio)")
+        self.assertEqual(devices[0]["channels"], 2)
+        self.assertTrue(devices[0]["is_default"])
+        self.assertIn("1: Microphone (USB Audio)", devices[0]["display"])
+
+        # Fallback gracioso quando módulo gera exceção
+        class FaultySoundDevice:
+            def query_devices(self):
+                raise RuntimeError("Driver de áudio desconectado")
+        faulty_devs = list_audio_input_devices(sd_module=FaultySoundDevice())
+        self.assertEqual(len(faulty_devs), 1)
+        self.assertEqual(faulty_devs[0]["index"], 0)
+
+    def test_play_audio_slice(self):
+        temp_dir = Path(tempfile.mkdtemp(prefix="rpg-test-playback-"))
+        try:
+            sr = 16000
+            t = np.linspace(0, 2.0, sr * 2, endpoint=False)
+            audio = (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+            wav_path = temp_dir / "sample.wav"
+            wavfile.write(wav_path, sr, audio)
+
+            played_slices = []
+            class MockSDPlayback:
+                def play(self, data, samplerate):
+                    played_slices.append((len(data), samplerate))
+                def stop(self):
+                    pass
+                def wait(self):
+                    pass
+
+            mock_sd = MockSDPlayback()
+            # Toca fatia de 0.5s até 1.5s (1.0s = 16000 amostras)
+            res = play_audio_slice(wav_path, start_sec=0.5, end_sec=1.5, sd_module=mock_sd, block=True)
+            self.assertTrue(res)
+            self.assertEqual(len(played_slices), 1)
+            self.assertEqual(played_slices[0][0], 16000)
+            self.assertEqual(played_slices[0][1], 16000)
+
+            # Arquivo inexistente retorna False sem erro fatal
+            res_missing = play_audio_slice(temp_dir / "inexistente.wav", 0.0, 1.0, sd_module=mock_sd)
+            self.assertFalse(res_missing)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_generate_interactive_lore_graph_html(self):
+        temp_dir = Path(tempfile.mkdtemp(prefix="rpg-test-graph-"))
+        try:
+            out_file = temp_dir / "lore_graph.html"
+            graph_dict = {
+                "factions": ["Ordem da Alvorada", "Culto das Cinzas"],
+                "characters": ["Valeros (Guerreiro)", "Eldrin (Mago)"],
+                "locations": ["Cidadela Solar", "Templo Subterrâneo"],
+                "relationships": [
+                    {"source": "Valeros", "target": "Ordem da Alvorada", "relation": "Aliado Jurado"},
+                    {"source": "Ordem da Alvorada", "target": "Culto das Cinzas", "relation": "Inimigo Mortal"},
+                ]
+            }
+            mermaid_code = (
+                "graph TD\n"
+                "    Valeros -->|Aliado| Ordem\n"
+                "    Ordem -.->|Guerra| Culto\n"
+            )
+            html_path = generate_interactive_lore_graph_html(
+                graph_dict=graph_dict,
+                mermaid_code=mermaid_code,
+                campanha_name="Crônicas de Tormenta",
+                output_path=out_file
+            )
+            self.assertTrue(html_path.exists())
+            content = html_path.read_text(encoding="utf-8")
+            self.assertIn("Crônicas de Tormenta", content)
+            self.assertIn("mermaid", content)
+            self.assertIn("Ordem da Alvorada", content)
+            self.assertIn("Valeros", content)
+            self.assertIn("Cidadela Solar", content)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_export_session_publishing_bundle(self):
+        temp_dir = Path(tempfile.mkdtemp(prefix="rpg-test-bundle-"))
+        try:
+            session_dir = temp_dir / "sessao_01"
+            session_dir.mkdir()
+            (session_dir / "audio.wav").write_bytes(b"RIFF dummy wav data")
+            (session_dir / "transcricao.txt").write_text("[00:00:01 -> 00:00:05] Mestre: Bem-vindos!", encoding="utf-8")
+            (session_dir / "diario.md").write_text("# Diário da Sessão\nResumo épico.", encoding="utf-8")
+            (session_dir / "novel.md").write_text("# Capítulo 1\nA jornada começa.", encoding="utf-8")
+
+            out_zip = temp_dir / "pacote_final.zip"
+            campaign_info = {
+                "campanha": "Mundo Antigo",
+                "sessao": "Sessão 01",
+                "data": "2026-09-04 20:00"
+            }
+            zip_res = export_session_publishing_bundle(session_dir, campaign_info=campaign_info, output_zip=out_zip)
+            self.assertTrue(zip_res.exists())
+
+            # Valida estrutura interna do arquivo ZIP
+            import zipfile
+            with zipfile.ZipFile(zip_res, "r") as zf:
+                names = zf.namelist()
+                self.assertIn("index.html", names)
+                self.assertTrue(any(n.startswith("audio/") for n in names))
+                self.assertTrue(any(n.startswith("documents/") for n in names))
+                self.assertTrue(any(n.startswith("interactive/") for n in names))
+
+                index_html = zf.read("index.html").decode("utf-8")
+                self.assertIn("Mundo Antigo", index_html)
+                self.assertIn("Sessão 01", index_html)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_detect_ollama_local_models(self):
+        # 1. Simula endpoint do Ollama respondendo com lista de modelos
+        fake_response = json.dumps({
+            "models": [
+                {"name": "llama3:8b", "modified_at": "2026-09-01"},
+                {"name": "qwen2.5-coder:7b", "modified_at": "2026-09-02"},
+                {"name": "mistral:latest", "modified_at": "2026-09-03"},
+            ]
+        }).encode("utf-8")
+
+        class MockHTTPResponse:
+            status = 200
+            def read(self):
+                return fake_response
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with mock.patch("urllib.request.urlopen", return_value=MockHTTPResponse()):
+            models = detect_ollama_local_models("http://mock-ollama:11434")
+            self.assertEqual(models, ["llama3:8b", "mistral:latest", "qwen2.5-coder:7b"])
+
+        # 2. Simula Ollama offline / conexão recusada
+        import urllib.error
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection refused")):
+            models_offline = detect_ollama_local_models("http://offline-ollama:11434")
+            self.assertEqual(models_offline, [])
 
 
 if __name__ == "__main__":

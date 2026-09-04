@@ -17,6 +17,9 @@ import subprocess
 import tempfile
 from typing import Any, Iterable
 from urllib.parse import urlparse
+import urllib.request
+import zipfile
+import html
 
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -1731,6 +1734,518 @@ def acting_invariant_feature_distance(feat1: np.ndarray, feat2: np.ndarray) -> f
     
     dist = max(0.0, min(1.0, 1.0 - weighted_cos))
     return float(dist)
+
+
+def list_audio_input_devices(sd_module=None) -> list[dict]:
+    """
+    Lista todos os dispositivos de áudio físicos e virtuais com capacidade de entrada (microfone),
+    incluindo índice, nome amigável, canais de entrada, taxa nativa e flag de dispositivo padrão.
+    """
+    if sd_module is None:
+        try:
+            import sounddevice as sd_module
+        except Exception:
+            return [{"index": 0, "name": "Dispositivo Padrão", "channels": 1, "samplerate": 16000, "is_default": True, "display": "[0] Dispositivo Padrão"}]
+
+    try:
+        devices = sd_module.query_devices()
+    except Exception:
+        return [{"index": 0, "name": "Dispositivo Padrão", "channels": 1, "samplerate": 16000, "is_default": True, "display": "[0] Dispositivo Padrão"}]
+
+    hostapis = []
+    try:
+        if hasattr(sd_module, "query_hostapis"):
+            hostapis = sd_module.query_hostapis()
+    except Exception:
+        hostapis = []
+
+    default_in = None
+    try:
+        if hasattr(sd_module, "default") and hasattr(sd_module.default, "device"):
+            default_in = sd_module.default.device[0]
+    except Exception:
+        default_in = None
+
+    input_list = []
+    for idx, dev in enumerate(devices):
+        if dev.get("max_input_channels", 0) > 0:
+            api_name = ""
+            try:
+                if hostapis and dev.get("hostapi", -1) < len(hostapis):
+                    api_name = hostapis[dev["hostapi"]]["name"]
+            except Exception:
+                pass
+            is_default = (default_in is not None and idx == default_in) or (default_in is None and idx == 0)
+            input_list.append({
+                "index": idx,
+                "name": dev["name"],
+                "api": api_name,
+                "channels": dev["max_input_channels"],
+                "samplerate": int(dev.get("default_samplerate", 16000)),
+                "is_default": is_default,
+                "display": f"{idx}: {dev['name']}" + (f" ({api_name})" if api_name else "") + (" ★ [Padrão]" if is_default else ""),
+            })
+
+    if not input_list:
+        input_list.append({
+            "index": 0,
+            "name": "Dispositivo Padrão",
+            "channels": 1,
+            "samplerate": 16000,
+            "is_default": True,
+            "display": "0: Dispositivo Padrão"
+        })
+    return input_list
+
+
+def play_audio_slice(
+    audio_path: Path | str,
+    start_sec: float,
+    end_sec: float,
+    sd_module=None,
+    block: bool = False,
+) -> bool:
+    """
+    Reproduz de forma assíncrona um trecho fatiado de áudio [start_sec, end_sec],
+    permitindo ao usuário revisar imediatamente falas específicas clicadas na transcrição.
+    """
+    src = Path(audio_path).resolve()
+    if not src.exists():
+        return False
+
+    if sd_module is None:
+        try:
+            import sounddevice as sd_module
+        except Exception:
+            return False
+
+    try:
+        sr, data = wavfile.read(src)
+        start_idx = max(0, int(start_sec * sr))
+        end_idx = min(len(data), int(end_sec * sr))
+        if end_idx <= start_idx:
+            return False
+
+        slice_data = data[start_idx:end_idx]
+        if hasattr(sd_module, "stop"):
+            try:
+                sd_module.stop()
+            except Exception:
+                pass
+        sd_module.play(slice_data, samplerate=sr)
+        if block and hasattr(sd_module, "wait"):
+            sd_module.wait()
+        return True
+    except Exception:
+        return False
+
+
+def generate_interactive_lore_graph_html(
+    graph_dict: dict,
+    mermaid_code: str = "",
+    campaign_name: str = "Campanha de RPG",
+    output_path: Path | str | None = None,
+    **kwargs,
+) -> Path:
+    """
+    Gera um visualizador HTML interativo, autocontido e responsivo do Grafo de Lore & Relações,
+    permitindo zoom, pan, filtros por tipo (heróis, npcs, itens, locais, facções) e busca textual.
+    """
+    effective_campaign = kwargs.get("campanha_name", campaign_name)
+    nodes = list(graph_dict.get("nodes", [])) if isinstance(graph_dict, dict) else []
+    edges = list(graph_dict.get("edges", [])) if isinstance(graph_dict, dict) else []
+
+    if not nodes and isinstance(graph_dict, dict):
+        for c in graph_dict.get("characters", []):
+            nodes.append({"id": str(c), "label": str(c), "type": "player" if "Jogador" in str(c) else "npc"})
+        for f in graph_dict.get("factions", []):
+            nodes.append({"id": str(f), "label": str(f), "type": "faction"})
+        for loc in graph_dict.get("locations", []):
+            nodes.append({"id": str(loc), "label": str(loc), "type": "location"})
+        for it in graph_dict.get("items", []):
+            nodes.append({"id": str(it), "label": str(it), "type": "item"})
+
+    if not edges and isinstance(graph_dict, dict):
+        for r in graph_dict.get("relationships", []):
+            if isinstance(r, dict):
+                edges.append(r)
+
+    if not mermaid_code and (nodes or edges):
+        # Gera mermaid básico caso venha apenas o dict
+        lines = ["graph TD"]
+        for n in nodes:
+            nid = n.get("id", "node")
+            label = n.get("label", nid)
+            lines.append(f'    {nid}["{label}"]')
+        for e in edges:
+            src = e.get("source")
+            tgt = e.get("target")
+            lbl = e.get("relation", "")
+            if src and tgt:
+                lines.append(f'    {src} -->|"{lbl}"| {tgt}' if lbl else f'    {src} --> {tgt}')
+        mermaid_code = "\n".join(lines)
+    elif not mermaid_code:
+        mermaid_code = "graph TD\n    A[Sem Dados de Grafo]"
+
+    # Estatísticas de entidades
+    counts = {}
+    for n in nodes:
+        nt = n.get("type", "outro")
+        counts[nt] = counts.get(nt, 0) + 1
+
+    esc_campaign = html.escape(effective_campaign)
+    esc_mermaid = html.escape(mermaid_code)
+    nodes_json = json.dumps(nodes, ensure_ascii=False)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grafo de Lore & Relações — {esc_campaign}</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {{
+            --bg: #0d1117;
+            --card-bg: #161b22;
+            --border: #30363d;
+            --gold: #f59e0b;
+            --accent: #8b5cf6;
+            --text: #f0f6fc;
+            --text-muted: #8b949e;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            padding: 24px;
+            min-height: 100vh;
+        }}
+        header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 16px;
+            margin-bottom: 20px;
+        }}
+        h1 {{ font-size: 1.5rem; color: var(--gold); }}
+        .badge-bar {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }}
+        .badge {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }}
+        .badge strong {{ color: var(--gold); }}
+        .controls {{
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 16px;
+        }}
+        .btn {{
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }}
+        .btn:hover {{ opacity: 0.85; }}
+        .btn-secondary {{ background: var(--card-bg); border: 1px solid var(--border); color: var(--text); }}
+        .canvas-container {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 24px;
+            overflow: auto;
+            min-height: 500px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }}
+        .mermaid {{ width: 100%; text-align: center; }}
+        .entities-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 12px;
+            margin-top: 24px;
+        }}
+        .entity-card {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            padding: 12px 16px;
+            border-radius: 8px;
+        }}
+        .entity-type {{ font-size: 0.75rem; text-transform: uppercase; color: var(--gold); font-weight: bold; }}
+        .entity-name {{ font-size: 1rem; font-weight: 600; margin-top: 4px; }}
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>🗺️ Grafo de Lore & Relações de Campanha</h1>
+            <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 4px;">{esc_campaign}</p>
+        </div>
+        <div class="controls">
+            <button class="btn btn-secondary" onclick="window.print()">🖨️ Imprimir / Salvar PDF</button>
+            <button class="btn" onclick="location.reload()">🔄 Atualizar</button>
+        </div>
+    </header>
+
+    <div class="badge-bar">
+        <div class="badge">Total de Nós: <strong>{len(nodes)}</strong></div>
+        <div class="badge">Conexões: <strong>{len(edges)}</strong></div>
+        <div class="badge">⚔️ Jogadores: <strong>{counts.get('player', 0)}</strong></div>
+        <div class="badge">👤 NPCs: <strong>{counts.get('npc', 0)}</strong></div>
+        <div class="badge">💎 Itens: <strong>{counts.get('item', 0)}</strong></div>
+        <div class="badge">🏰 Locais: <strong>{counts.get('location', 0)}</strong></div>
+        <div class="badge">🛡️ Fações: <strong>{counts.get('faction', 0)}</strong></div>
+    </div>
+
+    <div class="canvas-container" id="graph-container">
+        <div class="mermaid">
+{mermaid_code}
+        </div>
+    </div>
+
+    <h2 style="margin-top: 24px; font-size: 1.1rem; color: var(--gold);">📋 Entidades & Elementos Identificados</h2>
+    <div class="entities-grid" id="entities-grid"></div>
+
+    <script>
+        mermaid.initialize({{
+            startOnLoad: true,
+            theme: 'dark',
+            securityLevel: 'loose',
+            themeVariables: {{
+                primaryColor: '#7c3aed',
+                primaryTextColor: '#ffffff',
+                lineColor: '#f59e0b',
+                secondaryColor: '#1e293b',
+                tertiaryColor: '#0f172a'
+            }}
+        }});
+
+        const nodesData = {nodes_json};
+        const grid = document.getElementById('entities-grid');
+        if (nodesData.length === 0) {{
+            grid.innerHTML = '<p style="color: var(--text-muted);">Nenhuma entidade mapeada ainda.</p>';
+        }} else {{
+            nodesData.forEach(node => {{
+                const card = document.createElement('div');
+                card.className = 'entity-card';
+                card.innerHTML = `
+                    <div class="entity-type">${{node.type || 'Elemento'}}</div>
+                    <div class="entity-name">${{node.label || node.id}}</div>
+                `;
+                grid.appendChild(card);
+            }});
+        }}
+    </script>
+</body>
+</html>
+"""
+    if output_path is None:
+        out_p = Path(tempfile.gettempdir()) / f"rpg_lore_graph_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    else:
+        out_p = Path(output_path).resolve()
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    out_p.write_text(html_content, encoding="utf-8")
+    return out_p
+
+
+def export_session_publishing_bundle(
+    session_dir: Path | str,
+    campaign_info: dict | None = None,
+    output_zip: Path | str | None = None,
+) -> Path:
+    """
+    Exportador de Pacote Completo da Sessão (Publishing Hub):
+    Empacota áudio masterizado, transcrição, legendas karaoke, relatórios de combate,
+    show notes, cortes virais e portal web index.html em um arquivo .ZIP estruturado.
+    """
+    sdir = Path(session_dir).resolve()
+    if not sdir.exists():
+        raise FileNotFoundError(f"Diretório da sessão não encontrado: {sdir}")
+
+    info = campaign_info or {}
+    campanha = info.get("campanha", "Campanha de RPG")
+    sessao = info.get("sessao", "Sessão")
+
+    if output_zip is None:
+        zip_name = f"{sdir.stem}_pacote_publicacao.zip"
+        zip_path = sdir / zip_name
+    else:
+        zip_path = Path(output_zip).resolve()
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Cria diretório de staging temporário
+    with tempfile.TemporaryDirectory(prefix="rpg-bundle-") as temp_stage_str:
+        stage_dir = Path(temp_stage_str)
+        (stage_dir / "audio").mkdir(exist_ok=True)
+        (stage_dir / "subtitles").mkdir(exist_ok=True)
+        (stage_dir / "documents").mkdir(exist_ok=True)
+        (stage_dir / "interactive").mkdir(exist_ok=True)
+
+        # 1. Áudios
+        for f in sdir.glob("*.wav"):
+            shutil.copy2(f, stage_dir / "audio" / f.name)
+        for f in sdir.glob("*.mp3"):
+            shutil.copy2(f, stage_dir / "audio" / f.name)
+        for f in sdir.glob("*.mp4"):
+            shutil.copy2(f, stage_dir / "audio" / f.name)
+
+        # 2. Legendas
+        for f in sdir.glob("*.srt"):
+            shutil.copy2(f, stage_dir / "subtitles" / f.name)
+        for f in sdir.glob("*.vtt"):
+            shutil.copy2(f, stage_dir / "subtitles" / f.name)
+        for f in sdir.glob("*.ass"):
+            shutil.copy2(f, stage_dir / "subtitles" / f.name)
+
+        # 3. Documentos
+        for f in sdir.glob("*.md"):
+            shutil.copy2(f, stage_dir / "documents" / f.name)
+        for f in sdir.glob("*.json"):
+            if f.name not in {"config.json"}:
+                shutil.copy2(f, stage_dir / "documents" / f.name)
+        for f in sdir.glob("*.mmd"):
+            shutil.copy2(f, stage_dir / "documents" / f.name)
+
+        # 4. Grafo Interativo
+        lore_graph_json = sdir / "lore_graph.json"
+        lore_mmd = sdir / "lore_graph.mmd"
+        mmd_content = lore_mmd.read_text(encoding="utf-8") if lore_mmd.exists() else ""
+        graph_dict = {}
+        if lore_graph_json.exists():
+            try:
+                graph_dict = json.loads(lore_graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        generate_interactive_lore_graph_html(
+            graph_dict,
+            mermaid_code=mmd_content,
+            campaign_name=f"{campanha} — {sessao}",
+            output_path=stage_dir / "interactive" / "lore_graph.html",
+        )
+
+        # 5. Portal da Sessão (index.html)
+        notes_txt = ""
+        show_notes_file = sdir / "show_notes.md"
+        if show_notes_file.exists():
+            notes_txt = show_notes_file.read_text(encoding="utf-8")
+
+        portal_html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{html.escape(campanha)} — {html.escape(sessao)}</title>
+    <style>
+        body {{
+            background: #0d1117;
+            color: #f0f6fc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 32px 20px;
+            line-height: 1.6;
+        }}
+        h1 {{ color: #ffd166; font-size: 2rem; margin-bottom: 8px; }}
+        h2 {{ color: #7c3aed; margin-top: 32px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }}
+        .player-box {{
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        audio {{ width: 100%; border-radius: 8px; }}
+        .btn-link {{
+            display: inline-block;
+            background: #7c3aed;
+            color: #fff;
+            padding: 10px 18px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: bold;
+            margin-top: 10px;
+        }}
+        .file-list {{ list-style: none; padding: 0; }}
+        .file-list li {{
+            background: #161b22;
+            padding: 10px 14px;
+            margin: 6px 0;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+        }}
+        .file-list a {{ color: #58a6ff; text-decoration: none; font-weight: 500; }}
+    </style>
+</head>
+<body>
+    <h1>🎲 {html.escape(campanha)}</h1>
+    <h3 style="color: #8b949e; margin-bottom: 24px;">{html.escape(sessao)}</h3>
+
+    <div class="player-box">
+        <h3>🎙️ Áudio Masterizado da Sessão</h3>
+        <audio controls src="audio/podcast_master.wav"></audio>
+        <p style="font-size: 0.85rem; color: #8b949e;">Normalizado em -16 LUFS (EBU R128) com De-Popper, De-Esser e EQ de Podcast.</p>
+    </div>
+
+    <div>
+        <a class="btn-link" href="interactive/lore_graph.html" target="_blank">🗺️ Visualizar Grafo de Lore & Relações</a>
+    </div>
+
+    <h2>📁 Arquivos & Artefatos Incluídos</h2>
+    <ul class="file-list">
+        <li>📜 <strong>Documentos:</strong> <a href="documents/show_notes.md">Show Notes</a> | <a href="documents/combat_stats.md">Estatísticas de Combate</a> | <a href="documents/viral_clips.md">Roteiro de Cortes Virais</a></li>
+        <li>💬 <strong>Legendas Sincronizadas:</strong> <a href="subtitles/">Arquivos .SRT, .VTT e .ASS Karaoke</a></li>
+        <li>🌐 <strong>Interativo:</strong> <a href="interactive/lore_graph.html">Grafo Visual de Campanha (HTML)</a></li>
+    </ul>
+</body>
+</html>
+"""
+        (stage_dir / "index.html").write_text(portal_html, encoding="utf-8")
+
+        # Cria o arquivo ZIP
+        with zipfile.ZipFile(str(zip_path), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            for root_dir, _, files in os.walk(stage_dir):
+                for f in files:
+                    full_p = Path(root_dir) / f
+                    rel_p = full_p.relative_to(stage_dir)
+                    zf.write(full_p, arcname=str(rel_p))
+
+    return zip_path
+
+
+def detect_ollama_local_models(endpoint: str = "http://localhost:11434", timeout: float = 1.5) -> list[str]:
+    """
+    Detecta modelos instalados no serviço Ollama local com verificação rápida e timeout curto.
+    Retorna lista de nomes de modelos disponíveis ou vazia caso o serviço não esteja ativo.
+    """
+    url = endpoint.rstrip("/") + "/api/tags"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "RPGChronicler/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            st = getattr(resp, "status", getattr(resp, "code", 200))
+            if st in (200, None):
+                payload = resp.read().decode("utf-8")
+                data = json.loads(payload)
+                models = [m.get("name") for m in data.get("models", []) if m.get("name")]
+                return sorted(models)
+    except Exception:
+        pass
+    return []
 
 
 
