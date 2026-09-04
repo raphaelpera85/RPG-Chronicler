@@ -95,6 +95,13 @@ from rpg_chronicler_core import (
     generate_interactive_lore_graph_html,
     export_session_publishing_bundle,
     detect_ollama_local_models,
+    TimelineHighlight,
+    TimelineHighlightManager,
+    compress_audio_archive,
+    export_to_obsidian_vault,
+    export_to_foundry_vtt,
+    generate_session_narration_tts,
+    RPGCompanionWebServer,
 )
 from agents import (
     PodcastAudioEngineerAgent,
@@ -1509,6 +1516,13 @@ class AudioRecorder:
             self.current_filename.unlink(missing_ok=True)
         return None
 
+    def get_elapsed_seconds(self) -> float:
+        if self.is_recording and self.start_time:
+            return float(time.time() - self.start_time)
+        if self.frames_written > 0:
+            return float(self.frames_written / max(1, self.sample_rate))
+        return 0.0
+
 
 # ==========================================
 # INTERFACE GRÁFICA PRINCIPAL (GUI)
@@ -1533,8 +1547,18 @@ class RPGChroniclerApp:
         self.connection_check_generation = 0
 
         self.setup_ui_styles()
+        self.highlight_manager = TimelineHighlightManager()
+        self.companion_server = RPGCompanionWebServer()
+        self.companion_server.highlight_callback = self._on_companion_remote_highlight
+
         self.create_widgets()
         self.update_timer_loop()
+
+        # Hotkeys globais para marcação de momentos ao vivo
+        self.root.bind("<F9>", lambda e: self.add_timeline_marker("epic", "Momento Épico (F9)"))
+        self.root.bind("<F10>", lambda e: self.add_timeline_marker("critical", "Acerto/Erro Crítico (F10)"))
+        self.root.bind("<F11>", lambda e: self.add_timeline_marker("twist", "Plot Twist (F11)"))
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_config(self):
@@ -1884,6 +1908,80 @@ class RPGChroniclerApp:
             command=self.save_config
         )
         chk_calib.pack(pady=(12, 0))
+
+        # Marcadores de Linha do Tempo ao Vivo (Hotkeys F9/F10/F11)
+        hl_frame = tk.Frame(rec_card, bg=self.colors["card_bg"])
+        hl_frame.pack(fill="x", pady=(14, 0))
+
+        tk.Label(
+            hl_frame,
+            text="MARCADORES:",
+            font=("Segoe UI", 9, "bold"),
+            fg=self.colors["gold"],
+            bg=self.colors["card_bg"]
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            hl_frame,
+            text="⭐ Épico (F9)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#b45309",
+            fg="#ffffff",
+            padx=8,
+            pady=3,
+            relief="flat",
+            cursor="hand2",
+            command=lambda: self.add_timeline_marker("epic", "Momento Épico (F9)")
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            hl_frame,
+            text="⚔️ Crítico (F10)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#991b1b",
+            fg="#ffffff",
+            padx=8,
+            pady=3,
+            relief="flat",
+            cursor="hand2",
+            command=lambda: self.add_timeline_marker("critical", "Acerto/Erro Crítico (F10)")
+        ).pack(side="left", padx=3)
+
+        tk.Button(
+            hl_frame,
+            text="🎭 Plot Twist (F11)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#6b21a8",
+            fg="#ffffff",
+            padx=8,
+            pady=3,
+            relief="flat",
+            cursor="hand2",
+            command=lambda: self.add_timeline_marker("twist", "Plot Twist (F11)")
+        ).pack(side="left", padx=3)
+
+        self.btn_companion_toggle = tk.Button(
+            hl_frame,
+            text="🌐 Companion Celular",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1f6feb",
+            fg="#ffffff",
+            padx=8,
+            pady=3,
+            relief="flat",
+            cursor="hand2",
+            command=self.toggle_companion_server
+        )
+        self.btn_companion_toggle.pack(side="left", padx=(8, 4))
+
+        self.lbl_last_highlight = tk.Label(
+            hl_frame,
+            text="Dica: use F9, F10 ou F11 durante a gravação",
+            font=("Segoe UI", 9, "italic"),
+            fg=self.colors["text_muted"],
+            bg=self.colors["card_bg"]
+        )
+        self.lbl_last_highlight.pack(side="left", padx=6)
 
     def reload_audio_devices(self):
         devices = list_audio_input_devices(sd)
@@ -2950,6 +3048,16 @@ class RPGChroniclerApp:
         tk.Button(f_exp, text="📚 Copiar Novel", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=6, pady=4, command=lambda: self.copy_to_clipboard(self.txt_novel.get("1.0", "end"))).pack(side="left", padx=4)
         tk.Button(f_exp, text="🎨 Copiar Webtoon", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=6, pady=4, command=lambda: self.copy_to_clipboard(self.txt_webtoon.get("1.0", "end"))).pack(side="left", padx=4)
 
+        # Barra secundária de exportação e mídias
+        f_exp2 = tk.Frame(container, bg=self.colors["bg"])
+        f_exp2.pack(fill="x", pady=(6, 0))
+
+        tk.Button(f_exp2, text="📓 Obsidian Vault", font=("Segoe UI", 9, "bold"), bg="#7c3aed", fg="#fff", relief="flat", padx=8, pady=4, cursor="hand2", command=self.export_obsidian_vault_ui).pack(side="left", padx=4)
+        tk.Button(f_exp2, text="🎲 Foundry VTT", font=("Segoe UI", 9, "bold"), bg="#ea580c", fg="#fff", relief="flat", padx=8, pady=4, cursor="hand2", command=self.export_foundry_vtt_ui).pack(side="left", padx=4)
+        tk.Button(f_exp2, text="🎙️ Narrar Resumo (TTS)", font=("Segoe UI", 9, "bold"), bg="#0284c7", fg="#fff", relief="flat", padx=8, pady=4, cursor="hand2", command=self.narrate_summary_tts_ui).pack(side="left", padx=4)
+        tk.Button(f_exp2, text="🗜️ Comprimir Áudio (FLAC)", font=("Segoe UI", 9, "bold"), bg="#059669", fg="#fff", relief="flat", padx=8, pady=4, cursor="hand2", command=self.compress_audio_archive_ui).pack(side="left", padx=4)
+        tk.Button(f_exp2, text="🏷️ Marcadores Audacity (.txt)", font=("Segoe UI", 9), bg=self.colors["card_bg"], fg=self.colors["text"], relief="flat", padx=6, pady=4, cursor="hand2", command=self.export_markers_txt_ui).pack(side="left", padx=4)
+
     def _update_podcast_view(self, content):
         self.txt_podcast.delete("1.0", "end")
         self.txt_podcast.insert("1.0", content)
@@ -2998,7 +3106,8 @@ class RPGChroniclerApp:
             try:
                 self.update_ui_progress(30, "🎬 Curando Cortes Virais...", "Minerando picos dramáticos de 30 a 90 segundos...", color=self.colors["gold"])
                 scout = SocialClipsViralScoutAgent()
-                clips = scout.extract_clips(segments, max_clips=5)
+                hl_data = self.highlight_manager.to_dict() if hasattr(self, "highlight_manager") else []
+                clips = scout.extract_clips(segments, max_clips=5, highlights=hl_data)
                 if not clips:
                     self.update_ui_progress(100, "Sem Cortes", "Nenhum trecho com duração suficiente encontrado.", color=self.colors["text_muted"])
                     return
@@ -3271,6 +3380,7 @@ class RPGChroniclerApp:
             "ai_context_tokens": ai_context_tokens,
             "bible": self.txt_biblia.get("1.0", "end").strip(),
             "hf_token": os.getenv("HF_TOKEN", "").strip(),
+            "highlights": self.highlight_manager.to_dict() if hasattr(self, "highlight_manager") else [],
         }
 
     def confirm_cloud_processing(self, options):
@@ -3308,6 +3418,158 @@ class RPGChroniclerApp:
             self.processing_lock.release()
         self.set_processing_state(False)
 
+    def add_timeline_marker(self, category: str = "epic", description: str = ""):
+        elapsed = self.recorder.get_elapsed_seconds() if hasattr(self.recorder, "get_elapsed_seconds") else 0.0
+        if not description:
+            cat_names = {"epic": "Momento Épico", "critical": "Acerto/Erro Crítico", "twist": "Plot Twist"}
+            description = cat_names.get(category, "Destaque")
+        hl = self.highlight_manager.add_highlight(elapsed, category=category, description=description)
+        self._update_highlight_status_ui(hl)
+        if hasattr(self, "companion_server") and self.companion_server.is_running():
+            self.companion_server.update_session_data({
+                "highlights": self.highlight_manager.to_dict()
+            })
+
+    def _update_highlight_status_ui(self, hl):
+        msg = f"Marcador [{hl.formatted_time}] {hl.category.upper()} - {hl.description}"
+        LOGGER.info(msg)
+        if hasattr(self, "lbl_last_highlight"):
+            self.lbl_last_highlight.config(text=f"⭐ Último: [{hl.formatted_time}] {hl.category.upper()}: {hl.description}", fg=self.colors["gold"])
+
+    def _on_companion_remote_highlight(self, category: str, description: str) -> dict:
+        elapsed = self.recorder.get_elapsed_seconds() if hasattr(self.recorder, "get_elapsed_seconds") else 0.0
+        hl = self.highlight_manager.add_highlight(elapsed, category=category, description=description)
+        self.root.after(0, lambda: self._update_highlight_status_ui(hl))
+        return {
+            "timestamp": hl.timestamp,
+            "category": hl.category,
+            "description": hl.description,
+            "formatted_time": hl.formatted_time,
+        }
+
+    def toggle_companion_server(self):
+        if self.companion_server.is_running():
+            self.companion_server.stop()
+            if hasattr(self, "btn_companion_toggle"):
+                self.btn_companion_toggle.config(text="🌐 Companion Celular", bg="#1f6feb")
+            if hasattr(self, "lbl_last_highlight"):
+                self.lbl_last_highlight.config(text="Companion desligado", fg=self.colors["text_muted"])
+        else:
+            success = self.companion_server.start()
+            if success:
+                ip = self.companion_server.get_local_ip()
+                port = self.companion_server.port
+                url = f"http://{ip}:{port}"
+                if hasattr(self, "btn_companion_toggle"):
+                    self.btn_companion_toggle.config(text="🛑 Parar Companion", bg=self.colors["crimson"])
+                if hasattr(self, "lbl_last_highlight"):
+                    self.lbl_last_highlight.config(text=f"Companion: {url}", fg=self.colors["emerald"])
+                messagebox.showinfo("Companion Ativo", f"Painel de Jogadores iniciado com sucesso!\n\nDispositivos na mesma rede Wi-Fi podem acessar:\n{url}")
+            else:
+                messagebox.showerror("Erro no Servidor", "Não foi possível iniciar o servidor local na porta 8080.")
+
+    def export_obsidian_vault_ui(self):
+        dest_dir = filedialog.askdirectory(title="Selecione a Pasta para o Vault do Obsidian")
+        if not dest_dir:
+            return
+        campanha = self.campanha_entry.get().strip() or "Campanha"
+        sessao = self.sessao_entry.get().strip() or "Sessao"
+        session_data = {
+            "title": f"{campanha} - {sessao}",
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "duration": getattr(self, "timer_label", None).cget("text") if hasattr(self, "timer_label") else "00:00:00",
+            "summary": self.txt_resumo.get("1.0", "end").strip(),
+            "segments": getattr(self, "last_segments", []),
+            "highlights": self.highlight_manager.to_dict(),
+            "lore_entities": [c.get("name") for c in getattr(self, "last_graph_dict", {}).get("characters", [])] if hasattr(self, "last_graph_dict") else [],
+        }
+        try:
+            res = export_to_obsidian_vault(session_data, dest_dir)
+            messagebox.showinfo("Obsidian Vault Exportado", f"Vault gerado com sucesso!\n\nNota da Sessão: {Path(res['session_file']).name}\nEntidades geradas: {res['entities_created']}\nWikilinks sincronizados!")
+        except Exception as exc:
+            messagebox.showerror("Erro na Exportação", f"Falha ao gerar Obsidian Vault: {exc}")
+
+    def export_foundry_vtt_ui(self):
+        campanha = self.campanha_entry.get().strip() or "Campanha"
+        sessao = self.sessao_entry.get().strip() or "Sessao"
+        default_file = f"foundry_journal_{campanha}_{sessao}.json".replace(" ", "_")
+        out_file = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("Foundry VTT Journal (.json)", "*.json")],
+            initialfile=default_file,
+            title="Salvar Diário para Foundry VTT"
+        )
+        if not out_file:
+            return
+        session_data = {
+            "title": f"{campanha} - {sessao}",
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "summary": self.txt_resumo.get("1.0", "end").strip(),
+            "segments": getattr(self, "last_segments", []),
+            "highlights": self.highlight_manager.to_dict(),
+        }
+        try:
+            out_p = export_to_foundry_vtt(session_data, out_file)
+            messagebox.showinfo("Foundry VTT Exportado", f"JournalEntry gerado para Foundry VTT!\n\nArquivo: {out_p.name}\nImporte em Diário (Journals) no Foundry v10/v11/v12.")
+        except Exception as exc:
+            messagebox.showerror("Erro na Exportação", f"Falha ao gerar Foundry VTT JSON: {exc}")
+
+    def narrate_summary_tts_ui(self):
+        summary_text = self.txt_resumo.get("1.0", "end").strip()
+        if not summary_text:
+            messagebox.showwarning("Aviso", "Não há resumo da sessão gerado para narrar. Gere o diário primeiro.")
+            return
+        campanha = self.campanha_entry.get().strip() or "Campanha"
+        sessao = self.sessao_entry.get().strip() or "Sessao"
+        default_name = f"narracao_{campanha}_{sessao}.wav".replace(" ", "_")
+        out_wav = filedialog.asksaveasfilename(
+            defaultextension=".wav",
+            filetypes=[("Áudio WAV", "*.wav")],
+            initialfile=default_name,
+            title="Salvar Narração de Resumo em Áudio"
+        )
+        if not out_wav:
+            return
+        try:
+            generate_session_narration_tts(summary_text, out_wav, engine="system")
+            messagebox.showinfo("Narração Concluída", f"Resumo narrado com sucesso!\nSalvo em:\n{out_wav}")
+        except Exception as exc:
+            messagebox.showerror("Erro na Narração TTS", f"Falha ao sintetizar voz: {exc}")
+
+    def compress_audio_archive_ui(self):
+        audio_cand = getattr(self, "last_audio_file", None)
+        if not audio_cand or not Path(audio_cand).exists():
+            messagebox.showwarning("Aviso", "Nenhum arquivo de áudio recente encontrado para compressão.")
+            return
+        try:
+            stats = compress_audio_archive(audio_cand, target_format="flac")
+            mb_saved = stats["saved_bytes"] / (1024 * 1024)
+            messagebox.showinfo(
+                "Compressão Concluída",
+                f"Gravação comprimida para FLAC Lossless!\n\nArquivo: {Path(stats['target_path']).name}\nEconomia: {mb_saved:.2f} MB ({stats['compression_ratio_pct']}% reduzido) com fidelidade absoluta de estúdio!"
+            )
+        except Exception as exc:
+            messagebox.showerror("Erro na Compressão", f"Falha ao comprimir áudio: {exc}")
+
+    def export_markers_txt_ui(self):
+        if not self.highlight_manager.highlights:
+            messagebox.showwarning("Aviso", "Nenhum marcador de destaque foi registrado nesta sessão.")
+            return
+        default_name = "marcadores_sessao.txt"
+        out_txt = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Texto / Audacity Labels", "*.txt")],
+            initialfile=default_name,
+            title="Exportar Marcadores para Audacity"
+        )
+        if not out_txt:
+            return
+        try:
+            p = self.highlight_manager.export_markers_txt(out_txt)
+            messagebox.showinfo("Marcadores Exportados", f"Marcadores exportados para:\n{p.name}\nCompatível com Faixa de Rótulos (Labels) do Audacity.")
+        except Exception as exc:
+            messagebox.showerror("Erro", f"Falha ao salvar marcadores: {exc}")
+
     def on_close(self):
         if self.processing_lock.locked() and not messagebox.askyesno(
             "Processamento em andamento",
@@ -3315,6 +3577,11 @@ class RPGChroniclerApp:
         ):
             return
         self.cancel_event.set()
+        if hasattr(self, "companion_server") and self.companion_server and self.companion_server.is_running():
+            try:
+                self.companion_server.stop()
+            except Exception:
+                pass
         if self.recorder.is_recording:
             try:
                 self.recorder.stop()

@@ -46,3 +46,24 @@
 ## 12. Self-Contained Offline Publishing Bundles
 - Session exports (ZIP bundles) must be standalone and self-contained, including responsive HTML portals (`index.html`), interactive relationship graphs, subtitles (`.srt`, `.vtt`, `.ass`), and audio, enabling players to consume campaign content locally without needing Python or external server installations.
 
+## 13. Zero-Dependency Embedded Companion Server Architecture
+- Local LAN companion web servers designed for player interaction (smartphones, tablets at the table) should rely exclusively on Python standard library `http.server.ThreadingHTTPServer` running on a background daemon thread.
+- Avoid external web frameworks (FastAPI, Flask) in desktop client environments to preserve rapid startup times, eliminate dependency conflicts, and ensure graceful shutdown upon application exit (`WM_DELETE_WINDOW`).
+
+## 14. Native PowerShell TTS Bridge for Windows Environments
+- Text-to-Speech narration for session recaps in Windows desktop applications without heavy external pip wheels (`pyttsx3`, `pydub`, `soundfile`) should interface natively with Windows `System.Speech.Synthesis.SpeechSynthesizer` via PowerShell subprocess execution.
+- Temporary script files or inputs must be strictly encoded in UTF-8 (`[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`) to avoid character mangling with accented Portuguese phonemes.
+
+## 15. Lossless Archival Storage Optimization
+- Raw session WAV captures should be compressible to FLAC (compression level 8) using the native system `ffmpeg` binary (`-nostdin`, `-y`).
+- Compression must compute and report verifiable metrics (`orig_size_bytes`, `new_size_bytes`, `saved_bytes`, `compression_ratio_pct`) and only remove source files if explicitly opted-in and verification succeeds.
+
+## 16. Turnkey VTT and Personal Knowledge Management Interoperability
+- Campaign exports must support direct ingestion into standard RPG and note-taking tooling:
+  - **Obsidian Vault**: Generates structured folders (`Sessoes/`, `Entidades/`, `Destaques/`) with canonical YAML frontmatter. Entity names must be sorted by length descending before injecting wikilinks `[[...]]` to prevent partial substring collision.
+  - **Foundry VTT**: Produces valid `JournalEntry` JSON schema compatible with Foundry v10/v11/v12 including styled HTML pages for recap, combat highlights, and dialogue transcript.
+
+## 17. Human-in-the-Loop Timeline Highlighting for Viral Clips
+- Live operator hotkeys (`<F9>` Epic, `<F10>` Critical, `<F11>` Plot Twist) create timestamped anchor points (`TimelineHighlightManager`) that directly feed downstream viral clip extractors (`SocialClipsViralScoutAgent`).
+- Human temporal markers should confer substantial score boosts, aligning algorithmic clip curation with the table's genuine dramatic highlights.
+

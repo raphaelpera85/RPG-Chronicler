@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+import urllib.request
 import wave
 
 import numpy as np
@@ -81,6 +82,13 @@ from rpg_chronicler_core import (
     generate_interactive_lore_graph_html,
     export_session_publishing_bundle,
     detect_ollama_local_models,
+    TimelineHighlight,
+    TimelineHighlightManager,
+    compress_audio_archive,
+    export_to_obsidian_vault,
+    export_to_foundry_vtt,
+    generate_session_narration_tts,
+    RPGCompanionWebServer,
 )
 from agents import (
     PodcastAudioEngineerAgent,
@@ -1121,6 +1129,222 @@ class RPGChroniclerTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection refused")):
             models_offline = detect_ollama_local_models("http://offline-ollama:11434")
             self.assertEqual(models_offline, [])
+
+    def test_timeline_highlight_manager_and_viral_scout_integration(self):
+        manager = TimelineHighlightManager()
+        self.assertEqual(len(manager.highlights), 0)
+
+        # Adiciona marcadores fora de ordem para testar ordenação temporal
+        h2 = manager.add_highlight(45.5, category="critical", description="Nat 20 do Ladino")
+        h1 = manager.add_highlight(12.0, category="epic", description="Entrada do Dragão")
+        h3 = manager.add_highlight(80.0, category="twist", description="O aliado era o traidor")
+
+        self.assertEqual(len(manager.highlights), 3)
+        self.assertEqual(manager.highlights[0].timestamp, 12.0)
+        self.assertEqual(manager.highlights[0].formatted_time, "00:00:12")
+        self.assertEqual(manager.highlights[1].timestamp, 45.5)
+        self.assertEqual(manager.highlights[2].timestamp, 80.0)
+
+        # Roundtrip to_dict e from_dict
+        d = manager.to_dict()
+        self.assertEqual(len(d), 3)
+        self.assertEqual(d[0]["category"], "epic")
+
+        manager2 = TimelineHighlightManager()
+        manager2.from_dict(d)
+        self.assertEqual(len(manager2.highlights), 3)
+        self.assertEqual(manager2.highlights[1].description, "Nat 20 do Ladino")
+
+        # Exportação para arquivo de marcadores Audacity
+        out_markers = self.temp_path / "markers.txt"
+        exported = manager.export_markers_txt(out_markers)
+        self.assertTrue(exported.exists())
+        content = exported.read_text(encoding="utf-8")
+        self.assertIn("[EPIC] Entrada do Dragão", content)
+        self.assertIn("[CRITICAL] Nat 20 do Ladino", content)
+
+        # Integração com SocialClipsViralScoutAgent
+        scout = SocialClipsViralScoutAgent()
+        segments = [
+            {"start": i * 5.0, "end": (i + 1) * 5.0, "speaker": f"Voz {i%2}", "text": f"Fala dramática número {i}"}
+            for i in range(20)
+        ]
+        # Sem highlights
+        clips_normal = scout.extract_clips(segments, max_clips=3)
+        self.assertTrue(len(clips_normal) > 0)
+
+        # Com highlights cobrindo o timestamp 45.5
+        clips_boosted = scout.extract_clips(segments, max_clips=3, highlights=manager.to_dict())
+        self.assertTrue(len(clips_boosted) > 0)
+        self.assertTrue(any(c["virality_score"] >= 8 for c in clips_boosted))
+
+    def test_compress_audio_archive(self):
+        # Validação de erros
+        with self.assertRaises(FileNotFoundError):
+            compress_audio_archive(self.temp_path / "arquivo_inexistente.wav")
+
+        with self.assertRaises(ValueError):
+            compress_audio_archive(self.mono_wav, target_format="mp4_video")
+
+        # Compressão real para FLAC via FFmpeg nativo
+        out_flac = self.temp_path / "compressed_voice.flac"
+        stats = compress_audio_archive(self.mono_wav, target_format="flac", output_path=out_flac)
+        self.assertTrue(out_flac.exists())
+        self.assertGreater(out_flac.stat().st_size, 0)
+        self.assertEqual(stats["format"], "flac")
+        self.assertGreaterEqual(stats["orig_size_bytes"], 0)
+        self.assertGreater(stats["new_size_bytes"], 0)
+        self.assertIn("compression_ratio_pct", stats)
+
+    def test_export_to_obsidian_vault(self):
+        vault_dir = self.temp_path / "ObsidianVault"
+        session_data = {
+            "title": "A Batalha de Karaz-A-Karak",
+            "date": "2026-09-04",
+            "duration": "02:30:15",
+            "summary": "O grupo liderado por Valeros encontrou a maga Seoni nos portões do Castelo da Rocha.",
+            "segments": [
+                {"start": 10.0, "end": 15.0, "speaker": "Valeros", "text": "Preparem os escudos!"},
+                {"start": 16.0, "end": 22.0, "speaker": "Seoni", "text": "Vou conjurar uma bola de fogo no Castelo da Rocha!"},
+            ],
+            "highlights": [
+                {"timestamp": 16.5, "category": "epic", "description": "Bola de fogo crítica", "formatted_time": "00:00:16"}
+            ],
+        }
+        entities = ["Valeros", "Seoni", "Castelo da Rocha"]
+
+        res = export_to_obsidian_vault(session_data, vault_dir, lore_entities=entities)
+        self.assertTrue(Path(res["vault_dir"]).exists())
+        self.assertTrue(Path(res["session_file"]).exists())
+
+        # Verifica nota da sessão e wikilinks
+        session_note = Path(res["session_file"]).read_text(encoding="utf-8")
+        self.assertIn("[[Valeros]]", session_note)
+        self.assertIn("[[Seoni]]", session_note)
+        self.assertIn("[[Castelo da Rocha]]", session_note)
+        self.assertIn("tags:", session_note)
+
+        # Verifica notas individuais de entidades
+        ent_dir = vault_dir / "Entidades"
+        self.assertTrue((ent_dir / "Valeros.md").exists())
+        self.assertTrue((ent_dir / "Seoni.md").exists())
+        self.assertTrue((ent_dir / "Castelo da Rocha.md").exists())
+
+        # Verifica arquivo de destaques
+        dest_dir = vault_dir / "Destaques"
+        self.assertTrue(list(dest_dir.glob("*.md")))
+
+    def test_export_to_foundry_vtt(self):
+        out_foundry = self.temp_path / "foundry_journal_export.json"
+        session_data = {
+            "title": "Sessão 12 - Covil do Lich",
+            "date": "2026-09-04",
+            "summary": "Os heróis entraram na cripta e enfrentaram as hordas de mortos-vivos.",
+            "segments": [
+                {"start": 5.0, "end": 10.0, "speaker": "Mestre", "text": "Uma gargalhada ecoa pelas catacumbas."},
+            ],
+            "highlights": [
+                {"timestamp": 5.0, "category": "twist", "description": "O Lich despertou", "formatted_time": "00:00:05"}
+            ],
+        }
+
+        p = export_to_foundry_vtt(session_data, out_foundry)
+        self.assertTrue(p.exists())
+
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIn("name", data)
+        self.assertIn("Covil do Lich", data["name"])
+        self.assertIn("pages", data)
+        self.assertEqual(len(data["pages"]), 3)
+        self.assertEqual(data["pages"][0]["name"], "Crônica & Resumo")
+        self.assertEqual(data["pages"][1]["name"], "Momentos Épicos")
+        self.assertEqual(data["pages"][2]["name"], "Registro de Diálogo")
+        self.assertIn("flags", data)
+        self.assertIn("rpg_chronicler", data["flags"])
+
+    def test_generate_session_narration_tts(self):
+        # Validação de erro para texto vazio
+        with self.assertRaises(ValueError):
+            generate_session_narration_tts("", self.temp_path / "empty.wav")
+
+        # Mock OpenAI engine
+        mock_client = mock.MagicMock()
+        mock_response = mock.MagicMock()
+        mock_client.audio.speech.create.return_value = mock_response
+
+        out_openai = self.temp_path / "openai_tts.wav"
+        res_p = generate_session_narration_tts(
+            "Em uma terra distante, os bravos aventureiros se reuniram.",
+            out_openai,
+            openai_client=mock_client,
+            engine="openai",
+            voice_name="onyx"
+        )
+        self.assertEqual(res_p, out_openai)
+        mock_client.audio.speech.create.assert_called_once()
+        mock_response.stream_to_file.assert_called_once_with(str(out_openai))
+
+        # Teste do System Speech nativo Windows via PowerShell
+        out_sys = self.temp_path / "sys_tts.wav"
+        try:
+            generate_session_narration_tts(
+                "Os aventureiros descansam na taverna.",
+                out_sys,
+                engine="system"
+            )
+            self.assertTrue(out_sys.exists())
+            self.assertGreater(out_sys.stat().st_size, 0)
+        except Exception as exc:
+            self.assertIn("sapi", str(exc).lower() + "sapi")
+
+    def test_rpg_companion_web_server(self):
+        server = RPGCompanionWebServer(host="127.0.0.1", port=8991)
+        self.assertFalse(server.is_running())
+
+        highlight_received = []
+        def _on_hl(cat, desc):
+            highlight_received.append((cat, desc))
+            return {"category": cat, "description": desc, "status": "registered"}
+
+        server.highlight_callback = _on_hl
+        started = server.start()
+        self.assertTrue(started)
+        self.assertTrue(server.is_running())
+
+        # Teste 1: GET / (Dashboard HTML)
+        req = urllib.request.Request("http://127.0.0.1:8991/")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            self.assertEqual(resp.status, 200)
+            html_text = resp.read().decode("utf-8")
+            self.assertIn("RPG Chronicler", html_text)
+            self.assertIn("Companion", html_text)
+
+        # Teste 2: GET /api/session (JSON)
+        server.update_session_data({"title": "Sessão de Teste 99", "status": "Em Combate"})
+        req_api = urllib.request.Request("http://127.0.0.1:8991/api/session")
+        with urllib.request.urlopen(req_api, timeout=3.0) as resp_api:
+            self.assertEqual(resp_api.status, 200)
+            data = json.loads(resp_api.read().decode("utf-8"))
+            self.assertEqual(data.get("title"), "Sessão de Teste 99")
+            self.assertEqual(data.get("status"), "Em Combate")
+
+        # Teste 3: POST /api/highlight (Remote player trigger)
+        post_data = json.dumps({"category": "epic", "description": "Guerreiro derrubou o chefe"}).encode("utf-8")
+        req_post = urllib.request.Request("http://127.0.0.1:8991/api/highlight", data=post_data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req_post, timeout=3.0) as resp_post:
+            self.assertEqual(resp_post.status, 200)
+            post_res = json.loads(resp_post.read().decode("utf-8"))
+            self.assertEqual(post_res.get("status"), "ok")
+
+        self.assertEqual(len(highlight_received), 1)
+        self.assertEqual(highlight_received[0][0], "epic")
+        self.assertEqual(highlight_received[0][1], "Guerreiro derrubou o chefe")
+
+        # Finaliza servidor
+        server.stop()
+        self.assertFalse(server.is_running())
 
 
 if __name__ == "__main__":

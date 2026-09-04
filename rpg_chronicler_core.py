@@ -13,13 +13,17 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 from typing import Any, Iterable
+import urllib.parse
 from urllib.parse import urlparse
 import urllib.request
 import zipfile
 import html
+import http.server
 
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -2248,6 +2252,677 @@ def detect_ollama_local_models(endpoint: str = "http://localhost:11434", timeout
     return []
 
 
+# =====================================================================
+# 1. GERENCIADOR DE MARCADORES DE LINHA DO TEMPO (HIGHLIGHTS / HOTKEYS)
+# =====================================================================
+
+@dataclass
+class TimelineHighlight:
+    timestamp: float
+    category: str = "epic"  # 'epic', 'critical', 'twist', 'note'
+    description: str = ""
+    formatted_time: str = ""
+
+    def __post_init__(self):
+        if not self.formatted_time:
+            self.formatted_time = format_timestamp(max(0.0, float(self.timestamp)), decimal=".")[:8]
 
 
+class TimelineHighlightManager:
+    """Gerencia marcadores em tempo real durante a gravação da sessão de RPG.
 
+    Permite salvar momentos épicos, acertos/erros críticos e reviravoltas de roteiro
+    com timestamps precisos para orientar cortes virais e edição de podcast.
+    """
+
+    def __init__(self):
+        self.highlights: list[TimelineHighlight] = []
+
+    def add_highlight(self, timestamp: float, category: str = "epic", description: str = "") -> TimelineHighlight:
+        timestamp = max(0.0, float(timestamp))
+        category = (category or "epic").strip().lower()
+        hl = TimelineHighlight(timestamp=timestamp, category=category, description=description)
+        self.highlights.append(hl)
+        self.highlights.sort(key=lambda h: h.timestamp)
+        return hl
+
+    def to_dict(self) -> list[dict]:
+        return [
+            {
+                "timestamp": round(h.timestamp, 2),
+                "category": h.category,
+                "description": h.description,
+                "formatted_time": h.formatted_time,
+            }
+            for h in self.highlights
+        ]
+
+    def from_dict(self, data: list[dict]):
+        self.highlights = [
+            TimelineHighlight(
+                timestamp=float(d.get("timestamp", 0.0)),
+                category=str(d.get("category", "epic")),
+                description=str(d.get("description", "")),
+                formatted_time=str(d.get("formatted_time", "")),
+            )
+            for d in data
+        ]
+        self.highlights.sort(key=lambda h: h.timestamp)
+
+    def export_markers_txt(self, output_path: str | Path) -> Path:
+        """Exporta marcadores compatíveis com Audacity label track e texto de capítulos."""
+        p = Path(output_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for h in self.highlights:
+            label = f"[{h.category.upper()}] {h.description}".strip()
+            lines.append(f"{h.timestamp:.3f}\t{h.timestamp + 5.0:.3f}\t{label}")
+        p.write_text("\n".join(lines), encoding="utf-8")
+        return p
+
+    def clear(self):
+        self.highlights.clear()
+
+
+# =====================================================================
+# 2. COMPRESSOR INTELIGENTE DE ARMAZENAMENTO DE ÁUDIO (FLAC/OPUS/MP3)
+# =====================================================================
+
+def compress_audio_archive(
+    audio_path: str | Path,
+    target_format: str = "flac",
+    output_path: str | Path | None = None,
+    remove_source: bool = False,
+) -> dict:
+    """Comprime gravações de áudio WAV para formatos lossless (FLAC) ou lossy eficientes (Opus/MP3).
+
+    Utiliza FFmpeg nativo do sistema para máxima fidelidade e velocidade.
+    Retorna métricas detalhadas de compressão e bytes economizados.
+    """
+    src = Path(audio_path)
+    if not src.exists() or not src.is_file():
+        raise FileNotFoundError(f"Arquivo de áudio não encontrado: {src}")
+
+    target_format = target_format.lower().strip()
+    if target_format not in ("flac", "opus", "mp3"):
+        raise ValueError(f"Formato de compressão não suportado: {target_format}. Use 'flac', 'opus' ou 'mp3'.")
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("FFmpeg não encontrado no PATH do sistema. Instale o FFmpeg para compressão de áudio.")
+
+    if output_path is None:
+        dst = src.with_suffix(f".{target_format}")
+    else:
+        dst = Path(output_path)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    orig_size = src.stat().st_size
+
+    cmd = [ffmpeg_bin, "-y", "-i", str(src)]
+    if target_format == "flac":
+        cmd.extend(["-c:a", "flac", "-compression_level", "8"])
+    elif target_format == "opus":
+        cmd.extend(["-c:a", "libopus", "-b:a", "96k"])
+    elif target_format == "mp3":
+        cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+
+    cmd.append(str(dst))
+
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise RuntimeError(f"Falha na compressão FFmpeg ({res.returncode}): {res.stderr[-300:] if res.stderr else ''}")
+
+    new_size = dst.stat().st_size
+    saved_bytes = max(0, orig_size - new_size)
+    saved_ratio = (saved_bytes / max(1, orig_size)) * 100.0
+
+    if remove_source and src.resolve() != dst.resolve():
+        try:
+            src.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return {
+        "source_path": str(src),
+        "target_path": str(dst),
+        "format": target_format,
+        "orig_size_bytes": orig_size,
+        "new_size_bytes": new_size,
+        "saved_bytes": saved_bytes,
+        "compression_ratio_pct": round(saved_ratio, 2),
+    }
+
+
+# =====================================================================
+# 3. EXPORTADORES OBSIDIAN (COM WIKILINKS) & FOUNDRY VTT (JOURNAL ENTRY)
+# =====================================================================
+
+def export_to_obsidian_vault(
+    session_data: dict,
+    output_vault_dir: str | Path,
+    lore_entities: list[str] | None = None,
+) -> dict:
+    """Exporta sessão de RPG em formato Obsidian Vault com suporte a Wikilinks [[Entidade]].
+
+    Cria pastas 'Sessoes', 'Entidades' e 'Destaques' com frontmatter YAML canônico.
+    """
+    vault = Path(output_vault_dir)
+    sessoes_dir = vault / "Sessoes"
+    entidades_dir = vault / "Entidades"
+    destaques_dir = vault / "Destaques"
+    for d in (sessoes_dir, entidades_dir, destaques_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    title = session_data.get("title", "Sessão Sem Título")
+    date_str = session_data.get("date", datetime.now().strftime("%Y-%m-%d"))
+    duration = session_data.get("duration", "N/A")
+    summary = session_data.get("summary", "")
+    segments = session_data.get("segments", [])
+    highlights = session_data.get("highlights", [])
+    entities = list(lore_entities or session_data.get("lore_entities", []))
+
+    # Wikilink replacement helper (longer entities first to prevent nested substrings)
+    sorted_entities = sorted(set(e.strip() for e in entities if len(e.strip()) >= 2), key=len, reverse=True)
+
+    def inject_wikilinks(text: str) -> str:
+        if not sorted_entities or not text:
+            return text
+        result = text
+        for ent in sorted_entities:
+            pattern = re.compile(rf"(?<!\[\[)\b({re.escape(ent)})\b(?!\]\])", re.IGNORECASE)
+            result = pattern.sub(rf"[[\1]]", result)
+        return result
+
+    # 1. Nota da Sessão
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "Sessao"
+    session_file = sessoes_dir / f"{safe_title}.md"
+
+    frontmatter = f"""---
+title: "{title}"
+date: {date_str}
+duration: "{duration}"
+tags:
+  - rpg/sessao
+  - chronicler
+---
+"""
+    body = f"""# {title}
+
+**Data:** {date_str}  
+**Duração:** {duration}  
+
+## 📜 Crônica da Sessão
+{inject_wikilinks(summary)}
+
+## 🎙️ Transcrição por Diálogo
+"""
+    for seg in segments:
+        spk = seg.get("speaker", "Voz")
+        t0 = seg.get("start", 0.0)
+        t_fmt = format_timestamp(t0, decimal=".")[:8] if isinstance(t0, (int, float)) else str(t0)
+        text_line = inject_wikilinks(seg.get("text", ""))
+        body += f"- **[{t_fmt}] {spk}:** {text_line}\n"
+
+    session_file.write_text(frontmatter + "\n" + body, encoding="utf-8")
+
+    # 2. Notas de Entidades
+    created_entities = 0
+    for ent in sorted_entities:
+        safe_ent = re.sub(r'[\\/*?:"<>|]', "", ent).strip()
+        if safe_ent:
+            ent_file = entidades_dir / f"{safe_ent}.md"
+            if not ent_file.exists():
+                ent_content = f"""---
+name: "{safe_ent}"
+type: entity
+tags:
+  - rpg/entidade
+---
+
+# {safe_ent}
+
+*Mencionado inicialmente na sessão [[{safe_title}]].*
+
+## Descrição e Lore
+*(Adicione notas sobre antecedentes, objetivos e alianças de {safe_ent} aqui)*
+
+## Sessões com Aparições
+- [[{safe_title}]]
+"""
+                ent_file.write_text(ent_content, encoding="utf-8")
+                created_entities += 1
+
+    # 3. Nota de Destaques
+    if highlights:
+        hl_file = destaques_dir / f"Destaques - {safe_title}.md"
+        hl_content = f"""# ⭐ Destaques Épicos - {title}
+
+| Tempo | Categoria | Descrição |
+|---|---|---|
+"""
+        for h in highlights:
+            t_fmt = h.get("formatted_time") or (format_timestamp(h.get("timestamp", 0.0), decimal=".")[:8] if isinstance(h.get("timestamp"), (int, float)) else "00:00:00")
+            cat = h.get("category", "epic")
+            desc = h.get("description", "")
+            hl_content += f"| `{t_fmt}` | **{cat.upper()}** | {inject_wikilinks(desc)} |\n"
+        hl_file.write_text(hl_content, encoding="utf-8")
+
+    return {
+        "vault_dir": str(vault),
+        "session_file": str(session_file),
+        "entities_created": created_entities,
+        "has_highlights": bool(highlights),
+    }
+
+
+def export_to_foundry_vtt(session_data: dict, output_file: str | Path) -> Path:
+    """Exporta sessão de RPG em formato JournalEntry do Foundry VTT (v10+).
+
+    Gera um arquivo JSON importável diretamente na aba de Diário (Journals) do Foundry.
+    """
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    title = session_data.get("title", "Sessão de RPG")
+    date_str = session_data.get("date", datetime.now().strftime("%Y-%m-%d"))
+    summary = session_data.get("summary", "")
+    segments = session_data.get("segments", [])
+    highlights = session_data.get("highlights", [])
+
+    # Html summary page
+    summary_html = f"<h2>Resumo da Sessão ({date_str})</h2>"
+    for p in summary.split("\n\n"):
+        if p.strip():
+            summary_html += f"<p>{html.escape(p.strip())}</p>"
+
+    # Html highlights page
+    highlights_html = "<h2>⭐ Destaques e Momentos Épicos</h2><ul>"
+    if highlights:
+        for h in highlights:
+            t_fmt = h.get("formatted_time", "00:00:00")
+            cat = h.get("category", "epic")
+            desc = h.get("description", "")
+            highlights_html += f"<li><strong>[{html.escape(t_fmt)}] ({html.escape(cat.upper())}):</strong> {html.escape(desc)}</li>"
+    else:
+        highlights_html += "<li>Nenhum destaque manual registrado.</li>"
+    highlights_html += "</ul>"
+
+    # Html transcription page
+    transcription_html = "<h2>🎙️ Transcrição Completa</h2><div class='dialogue-log'>"
+    for seg in segments:
+        spk = seg.get("speaker", "Voz")
+        t0 = seg.get("start", 0.0)
+        t_fmt = format_timestamp(t0, decimal=".")[:8] if isinstance(t0, (int, float)) else str(t0)
+        text_line = seg.get("text", "")
+        transcription_html += f"<p><span style='color: #4a90e2; font-weight: bold;'>[{t_fmt}] {html.escape(spk)}:</span> {html.escape(text_line)}</p>"
+    transcription_html += "</div>"
+
+    journal_entry = {
+        "name": f"{title} ({date_str})",
+        "pages": [
+            {
+                "name": "Crônica & Resumo",
+                "type": "text",
+                "text": {
+                    "content": summary_html,
+                    "format": 1,  # CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML
+                },
+                "title": {"show": True, "level": 1},
+            },
+            {
+                "name": "Momentos Épicos",
+                "type": "text",
+                "text": {
+                    "content": highlights_html,
+                    "format": 1,
+                },
+                "title": {"show": True, "level": 1},
+            },
+            {
+                "name": "Registro de Diálogo",
+                "type": "text",
+                "text": {
+                    "content": transcription_html,
+                    "format": 1,
+                },
+                "title": {"show": True, "level": 1},
+            },
+        ],
+        "flags": {
+            "rpg_chronicler": {
+                "version": "1.0",
+                "exported_at": datetime.now().isoformat(),
+            }
+        },
+    }
+
+    out_path.write_text(json.dumps(journal_entry, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
+
+
+# =====================================================================
+# 4. GERADOR DE NARRAÇÃO DE RESUMO POR VOZ (TTS OFFLINE / OPENAI)
+# =====================================================================
+
+def generate_session_narration_tts(
+    text: str,
+    output_wav: str | Path,
+    voice_name: str | None = None,
+    openai_client: Any = None,
+    model: str = "tts-1",
+    engine: str = "system",
+) -> Path:
+    """Gera arquivo WAV narrando o resumo da sessão.
+
+    Suporta:
+    - 'system': Windows Speech API nativa (System.Speech.Synthesis) via PowerShell sem dependências pip.
+    - 'openai': OpenAI TTS API (caso cliente OpenAI esteja configurado).
+    """
+    out = Path(output_wav)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    text_clean = text.strip()
+    if not text_clean:
+        raise ValueError("Texto para narração está vazio.")
+
+    if engine == "openai" and openai_client:
+        voice = voice_name or "onyx"
+        response = openai_client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=text_clean[:4096],
+        )
+        response.stream_to_file(str(out))
+        return out
+
+    # Engine nativa Windows via PowerShell System.Speech
+    ps_script = f"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+"""
+    if voice_name:
+        ps_script += f"""
+try {{ $synth.SelectVoice('{voice_name}') }} catch {{}}
+"""
+    temp_txt = out.with_suffix(".temp_tts.txt")
+    temp_txt.write_text(text_clean, encoding="utf-8")
+
+    ps_script += f"""
+$content = Get-Content -Path '{temp_txt}' -Raw -Encoding UTF8
+$synth.SetOutputToWaveFile('{out}')
+$synth.Speak($content)
+$synth.Dispose()
+"""
+    ps_file = out.with_suffix(".temp_tts.ps1")
+    ps_file.write_text(ps_script, encoding="utf-8")
+
+    try:
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps_file)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if res.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+            raise RuntimeError(f"Falha na síntese de voz nativa: {res.stderr}")
+    finally:
+        ps_file.unlink(missing_ok=True)
+        temp_txt.unlink(missing_ok=True)
+
+    return out
+
+
+# =====================================================================
+# 5. PAINEL COMPANION WEB LOCAL WI-FI (HTTP.SERVER ZERO-DEPENDENCY)
+# =====================================================================
+
+class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Handler HTTP para o painel companion local via Wi-Fi."""
+
+    server_ref: Any = None
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/session":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            data = self.server_ref.get_session_data() if self.server_ref else {}
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        elif parsed.path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            html_page = self.server_ref.render_dashboard_html() if self.server_ref else "<h1>RPG Chronicler</h1>"
+            self.wfile.write(html_page.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/highlight":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {}
+            if self.server_ref:
+                hl = self.server_ref.on_remote_highlight(payload)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "highlight": hl}, ensure_ascii=False).encode("utf-8"))
+            else:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Silencia logs no terminal para não poluir o console do app
+
+
+class RPGCompanionWebServer:
+    """Servidor web local leve (sem frameworks externos) para jogadores acompanharem a sessão no celular."""
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080):
+        self.host = host
+        self.port = port
+        self.server: http.server.ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
+        self.highlight_callback: Any = None
+        self.session_data: dict = {
+            "title": "Sessão Ativa",
+            "status": "Gravando...",
+            "duration": "00:00:00",
+            "recent_dialogues": [],
+            "highlights": [],
+            "summary": "Sessão em andamento.",
+        }
+
+    def start(self) -> bool:
+        if self.server is not None:
+            return True
+        try:
+            handler_class = RPGCompanionHTTPHandler
+            handler_class.server_ref = self
+            self.server = http.server.ThreadingHTTPServer((self.host, self.port), handler_class)
+            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.thread.start()
+            return True
+        except Exception:
+            self.server = None
+            return False
+
+    def stop(self):
+        if self.server:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception:
+                pass
+            self.server = None
+            self.thread = None
+
+    def is_running(self) -> bool:
+        return self.server is not None
+
+    def update_session_data(self, data: dict):
+        with self.lock:
+            self.session_data.update(data)
+
+    def get_session_data(self) -> dict:
+        with self.lock:
+            return dict(self.session_data)
+
+    def on_remote_highlight(self, payload: dict) -> dict:
+        category = payload.get("category", "epic")
+        description = payload.get("description", "Marcado via Celular")
+        if callable(self.highlight_callback):
+            return self.highlight_callback(category, description)
+        return {"category": category, "description": description}
+
+    @staticmethod
+    def get_local_ip() -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    def render_dashboard_html(self) -> str:
+        return """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RPG Chronicler - Companion de Mesa</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --card: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --gold: #f1c40f;
+            --accent: #58a6ff;
+            --green: #2ea043;
+            --red: #da3633;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 16px;
+        }
+        .header {
+            text-align: center;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 12px;
+            margin-bottom: 16px;
+        }
+        .title { color: var(--gold); font-size: 1.4rem; font-weight: bold; margin: 0; }
+        .status-badge {
+            display: inline-block;
+            background: var(--green);
+            color: #fff;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            margin-top: 6px;
+        }
+        .btn-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .btn {
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: bold;
+            cursor: pointer;
+            text-align: center;
+        }
+        .btn:active { transform: scale(0.98); }
+        .btn-epic { border-color: var(--gold); color: var(--gold); }
+        .btn-crit { border-color: var(--red); color: var(--red); }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+            margin-bottom: 16px;
+        }
+        .card h3 { margin-top: 0; font-size: 1.1rem; color: var(--accent); }
+        .dialogue-item { padding: 6px 0; border-bottom: 1px solid #21262d; font-size: 0.95rem; }
+        .speaker { font-weight: bold; color: var(--gold); }
+        .highlight-badge { background: #388bfd33; color: var(--accent); padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title" id="sess-title">⚔️ RPG Chronicler Companion</div>
+        <div class="status-badge" id="sess-status">Conectado</div>
+    </div>
+    <div class="btn-grid">
+        <button class="btn btn-epic" onclick="sendHighlight('epic', 'Momento Épico via Mobile')">⭐ Momento Épico</button>
+        <button class="btn btn-crit" onclick="sendHighlight('critical', 'Crítico / Reviravolta')">⚔️ Crítico!</button>
+    </div>
+    <div class="card">
+        <h3>🎙️ Últimos Diálogos</h3>
+        <div id="dialogues">Aguardando falas...</div>
+    </div>
+    <div class="card">
+        <h3>⭐ Destaques Recentes</h3>
+        <div id="highlights">Nenhum destaque ainda.</div>
+    </div>
+    <script>
+        async function fetchState() {
+            try {
+                const res = await fetch('/api/session');
+                const d = await res.json();
+                if (d.title) document.getElementById('sess-title').innerText = d.title;
+                if (d.status) document.getElementById('sess-status').innerText = d.status;
+                if (d.recent_dialogues && d.recent_dialogues.length > 0) {
+                    document.getElementById('dialogues').innerHTML = d.recent_dialogues.slice(-6).map(s =>
+                        `<div class="dialogue-item"><span class="speaker">${s.speaker || 'Voz'}:</span> ${s.text}</div>`
+                    ).join('');
+                }
+                if (d.highlights && d.highlights.length > 0) {
+                    document.getElementById('highlights').innerHTML = d.highlights.slice(-4).map(h =>
+                        `<div class="dialogue-item"><span class="highlight-badge">[${h.category.toUpperCase()}]</span> ${h.description || 'Destaque'} (${h.formatted_time || ''})</div>`
+                    ).join('');
+                }
+            } catch (e) {}
+        }
+        async function sendHighlight(cat, desc) {
+            try {
+                await fetch('/api/highlight', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ category: cat, description: desc })
+                });
+                alert('Marcador enviado para o Mestre!');
+                fetchState();
+            } catch(e) { alert('Erro ao enviar marcador.'); }
+        }
+        setInterval(fetchState, 3000);
+        fetchState();
+    </script>
+</body>
+</html>
+"""

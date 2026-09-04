@@ -184,6 +184,7 @@ class SocialClipsViralScoutAgent:
         self,
         segments: List[Dict[str, Any]],
         max_clips: int = 5,
+        highlights: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         clips = []
         if not segments:
@@ -208,7 +209,14 @@ class SocialClipsViralScoutAgent:
                 impact_keywords = ["dado", "crítico", "iniciativa", "morreu", "ataque", "magia", "segredo", "droga", "cuidado", "olha isso"]
                 keyword_hits = sum(1 for kw in impact_keywords if kw in full_text)
 
-                score = (len(speakers) * 2.0) + (dialogue_density * 10.0) + (keyword_hits * 3.0)
+                hl_bonus = 0.0
+                if highlights:
+                    for hl in highlights:
+                        hl_t = float(hl.get("timestamp", -999.0))
+                        if t_start - 5.0 <= hl_t <= t_end + 5.0:
+                            hl_bonus += 50.0
+
+                score = (len(speakers) * 2.0) + (dialogue_density * 10.0) + (keyword_hits * 3.0) + hl_bonus
                 candidates.append((score, window, t_start, t_end, duration))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -752,7 +760,8 @@ def run_all_runtime_specialists(
     clips = []
     try:
         scout = SocialClipsViralScoutAgent()
-        clips = scout.extract_clips(segments, max_clips=5)
+        highlights_data = campaign_options.get("highlights", [])
+        clips = scout.extract_clips(segments, max_clips=5, highlights=highlights_data)
         atomic_write_json(run_dir / "viral_clips.json", {"clips": clips})
         clips_md = "# 🎬 Cortes Virais da Sessão (TikTok / Reels / Shorts)\n\n"
         for c in clips:
