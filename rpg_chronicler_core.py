@@ -2790,10 +2790,22 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_response(500)
                 self.end_headers()
+        elif parsed.path == "/api/participants/add":
+            if self.server_ref:
+                res = self.server_ref.on_remote_add_participant(payload)
+                status_code = 200 if (res.get("status") == "ok" or res.get("ok") is True) else 400
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, ensure_ascii=False).encode("utf-8"))
+            else:
+                self.send_response(500)
+                self.end_headers()
         elif parsed.path == "/api/voice/train":
             if self.server_ref:
                 res = self.server_ref.on_remote_voice_train(payload)
-                status_code = 200 if res.get("status") == "ok" else 400
+                status_code = 200 if (res.get("status") == "ok" or res.get("ok") is True) else 400
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -2805,7 +2817,7 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == "/api/satellite/chunk":
             if self.server_ref:
                 res = self.server_ref.on_remote_satellite_chunk(payload)
-                status_code = 200 if res.get("status") == "ok" else 400
+                status_code = 200 if (res.get("status") == "ok" or res.get("ok") is True) else 400
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -2836,6 +2848,7 @@ class RPGCompanionWebServer:
         self.voice_train_callback: Any = None
         self.satellite_chunk_callback: Any = None
         self.get_participants_callback: Any = None
+        self.add_participant_callback: Any = None
         self.session_data: dict = {
             "title": "Sessão Ativa",
             "status": "Gravando...",
@@ -2890,10 +2903,86 @@ class RPGCompanionWebServer:
     def get_participants(self) -> list[dict]:
         if callable(self.get_participants_callback):
             try:
-                return self.get_participants_callback() or []
+                res = self.get_participants_callback()
+                if res:
+                    return res
             except Exception:
-                return []
+                pass
+
+        # Fallback 1: ler do arquivo de configuração do RPG Chronicler se existir
+        try:
+            cfg_path = Path("rpg_chronicler_config.json")
+            if cfg_path.exists():
+                with open(cfg_path, "r", encoding="utf-8-sig") as f:
+                    cfg_disk = json.load(f)
+                    raw_parts = cfg_disk.get("participantes", [])
+                    if raw_parts:
+                        res = []
+                        for p in raw_parts:
+                            if isinstance(p, dict):
+                                nome = p.get("nome", "").strip()
+                                pers = p.get("personagem", "").strip()
+                                papel = p.get("papel", "Jogador").strip()
+                                lbl = f"[Mestre {nome} - Narração de Cenários/NPCs]" if papel == "Mestre da Mesa" else f"[{pers} ({nome})]"
+                                disp = f"{pers} ({nome})" if papel != "Mestre da Mesa" else f"👑 Mestre {nome} ({pers})"
+                                res.append({
+                                    "label": lbl,
+                                    "display_name": disp,
+                                    "nome": nome,
+                                    "personagem": pers,
+                                    "papel": papel
+                                })
+                            else:
+                                res.append({"label": str(p), "display_name": str(p), "name": str(p)})
+                        return res
+        except Exception:
+            pass
+
+        # Fallback 2: banco de perfis de vozes já treinados
+        try:
+            profiles_path = Path("perfis_vozes.json")
+            if profiles_path.exists():
+                with open(profiles_path, "r", encoding="utf-8") as f:
+                    profs = json.load(f)
+                    if profs:
+                        return [{"label": k, "display_name": k, "name": k} for k in profs.keys()]
+        except Exception:
+            pass
+
         return []
+
+    def on_remote_add_participant(self, payload: dict) -> dict:
+        nome = (payload.get("nome") or payload.get("name") or "").strip()
+        personagem = (payload.get("personagem") or payload.get("character") or "").strip()
+        papel = (payload.get("papel") or payload.get("role") or "Jogador").strip()
+        if not nome and not personagem:
+            return {"status": "error", "message": "Informe ao menos seu nome ou o do personagem."}
+        if not nome:
+            nome = personagem
+        if not personagem:
+            personagem = nome
+
+        if callable(self.add_participant_callback):
+            try:
+                res = self.add_participant_callback(nome, personagem, papel)
+                if isinstance(res, dict):
+                    return res
+            except Exception as exc:
+                return {"status": "error", "message": str(exc)}
+
+        label = f"[Mestre {nome} - Narração de Cenários/NPCs]" if papel == "Mestre da Mesa" else f"[{personagem} ({nome})]"
+        disp = f"{personagem} ({nome})" if papel != "Mestre da Mesa" else f"👑 Mestre {nome} ({personagem})"
+        return {
+            "status": "ok",
+            "ok": True,
+            "participant": {
+                "label": label,
+                "display_name": disp,
+                "nome": nome,
+                "personagem": personagem,
+                "papel": papel
+            }
+        }
 
     def on_remote_highlight(self, payload: dict) -> dict:
         category = payload.get("category", "epic")
@@ -3116,6 +3205,38 @@ class RPGCompanionWebServer:
             color: var(--text-muted);
         }
         .pill-tab.active { background: var(--accent); color: #000; font-weight: bold; border-color: var(--accent); }
+        .btn-sm {
+            background: #1f293d;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .btn-sm:active { transform: scale(0.95); }
+        .btn-link {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 0.82rem;
+            cursor: pointer;
+            text-decoration: underline;
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+        }
+        .shake {
+            animation: shake 0.4s ease-in-out;
+            border-color: var(--red) !important;
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.4) !important;
+        }
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            20%, 60% { transform: translateX(-6px); }
+            40%, 80% { transform: translateX(6px); }
+        }
     </style>
 </head>
 <body>
@@ -3128,16 +3249,41 @@ class RPGCompanionWebServer:
     </div>
 
     <!-- SELEÇÃO DE PERSONAGEM -->
-    <div class="card">
-        <h3>🎭 Meu Personagem na Mesa</h3>
+    <div class="card" id="card-personagem">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <h3 style="margin: 0;">🎭 Meu Personagem na Mesa</h3>
+            <button class="btn-sm" type="button" onclick="loadParticipants(true)" title="Recarregar lista do PC">🔄 Atualizar</button>
+        </div>
+        <div id="player-alert" class="alert-box alert-warn" style="display: none; margin-bottom: 10px;"></div>
+
         <div class="form-group">
             <label for="player-select">Selecione quem você está interpretando:</label>
             <select id="player-select" onchange="onPlayerChange()">
                 <option value="">-- Carregando participantes... --</option>
             </select>
         </div>
-        <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 4px;">
-            Essa escolha orienta o treino de voz e o microfone satélite no seu aparelho.
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+            <div style="font-size: 0.78rem; color: var(--text-muted);">
+                Essa escolha orienta o treino de voz e o microfone satélite no seu aparelho.
+            </div>
+            <button type="button" class="btn-link" onclick="toggleAddPlayerForm()" id="btn-toggle-add">➕ Não achou? Cadastre-se</button>
+        </div>
+
+        <!-- FORMULÁRIO DE CADASTRO RÁPIDO -->
+        <div id="add-player-box" style="display: none; margin-top: 12px; padding: 12px; background: #0d131d; border: 1px solid var(--border); border-radius: 8px;">
+            <div style="font-weight: bold; font-size: 0.9rem; margin-bottom: 8px; color: var(--accent);">➕ Cadastrar Personagem na Mesa</div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <input type="text" id="new-player-nome" placeholder="Seu nome real (ex: Raphael)" style="padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.88rem;">
+                <input type="text" id="new-player-pers" placeholder="Nome do personagem (ex: Lorenzo)" style="padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.88rem;">
+                <select id="new-player-papel" style="padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.88rem;">
+                    <option value="Jogador">Papel: Jogador</option>
+                    <option value="Mestre da Mesa">Papel: Mestre da Mesa</option>
+                </select>
+                <div style="display: flex; gap: 8px; margin-top: 4px;">
+                    <button class="btn btn-primary" style="flex: 1; padding: 10px;" type="button" onclick="submitNewPlayer()">Salvar e Selecionar</button>
+                    <button class="btn" style="flex: 0 0 80px; padding: 10px;" type="button" onclick="toggleAddPlayerForm(false)">Fechar</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -3208,30 +3354,112 @@ class RPGCompanionWebServer:
             document.getElementById('tab-p2').classList.toggle('active', num === 2);
         }
 
-        function onPlayerChange() {
-            const val = document.getElementById('player-select').value;
-            if (val) localStorage.setItem('rpg_selected_player', val);
+        function toggleAddPlayerForm(force) {
+            const box = document.getElementById('add-player-box');
+            const btn = document.getElementById('btn-toggle-add');
+            const show = force !== undefined ? force : (box.style.display === 'none');
+            box.style.display = show ? 'block' : 'none';
+            btn.innerText = show ? '✖ Fechar cadastro' : '➕ Não achou? Cadastre-se';
+            if (show) {
+                setTimeout(() => document.getElementById('new-player-nome').focus(), 100);
+            }
         }
 
-        async function loadParticipants() {
+        function showPlayerAlert(msg) {
+            const alertBox = document.getElementById('player-alert');
+            const sel = document.getElementById('player-select');
+            alertBox.innerText = msg;
+            alertBox.style.display = 'block';
+            sel.classList.add('shake');
+            setTimeout(() => sel.classList.remove('shake'), 600);
+            document.getElementById('card-personagem').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function onPlayerChange() {
+            const val = document.getElementById('player-select').value;
+            if (val) {
+                localStorage.setItem('rpg_selected_player', val);
+                document.getElementById('player-alert').style.display = 'none';
+            }
+        }
+
+        async function submitNewPlayer() {
+            const nomeInput = document.getElementById('new-player-nome');
+            const persInput = document.getElementById('new-player-pers');
+            const papel = document.getElementById('new-player-papel').value;
+            const nome = nomeInput.value.trim();
+            const personagem = persInput.value.trim();
+
+            if (!nome && !personagem) {
+                alert('Preencha seu nome ou o nome do personagem!');
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/participants/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nome: nome || personagem, personagem: personagem || nome, papel })
+                });
+                const data = await res.json();
+                if ((data.status === 'ok' || data.ok) && data.participant) {
+                    const p = data.participant;
+                    localStorage.setItem('rpg_selected_player', p.label);
+                    await loadParticipants();
+                    toggleAddPlayerForm(false);
+                    nomeInput.value = '';
+                    persInput.value = '';
+                    const alertBox = document.getElementById('player-alert');
+                    alertBox.className = 'alert-box alert-success';
+                    alertBox.innerText = `✅ Personagem '${p.display_name || p.label}' selecionado com sucesso!`;
+                    alertBox.style.display = 'block';
+                    setTimeout(() => { alertBox.style.display = 'none'; alertBox.className = 'alert-box alert-warn'; }, 4000);
+                } else {
+                    alert('Erro ao cadastrar personagem: ' + (data.message || 'Falha no servidor.'));
+                }
+            } catch(e) {
+                alert('Erro de conexão ao salvar personagem: ' + e.message);
+            }
+        }
+
+        async function loadParticipants(isManualRefresh = false) {
             try {
                 const res = await fetch('/api/participants');
                 const data = await res.json();
                 const sel = document.getElementById('player-select');
-                sel.innerHTML = '';
                 const parts = data.participants || [];
+                sel.innerHTML = '';
+
                 if (parts.length === 0) {
                     sel.innerHTML = '<option value="">Nenhum participante configurado no PC</option>';
+                    toggleAddPlayerForm(true);
                     return;
                 }
+
                 const saved = localStorage.getItem('rpg_selected_player');
+                const defaultOpt = document.createElement('option');
+                defaultOpt.value = '';
+                defaultOpt.innerText = '-- Selecione seu Personagem --';
+                sel.appendChild(defaultOpt);
+
                 parts.forEach(p => {
                     const opt = document.createElement('option');
-                    opt.value = p.label || p.nome || p;
-                    opt.innerText = p.label || p.nome || p;
-                    if (opt.value === saved) opt.selected = true;
+                    const val = p.label || p.nome || p;
+                    opt.value = val;
+                    opt.innerText = p.display_name || p.label || p.nome || p;
+                    if (saved && (val === saved || (p.label && p.label === saved))) {
+                        opt.selected = true;
+                    }
                     sel.appendChild(opt);
                 });
+
+                if (isManualRefresh) {
+                    const alertBox = document.getElementById('player-alert');
+                    alertBox.className = 'alert-box alert-success';
+                    alertBox.innerText = `🔄 Lista atualizada (${parts.length} participantes disponíveis)!`;
+                    alertBox.style.display = 'block';
+                    setTimeout(() => { alertBox.style.display = 'none'; alertBox.className = 'alert-box alert-warn'; }, 3000);
+                }
             } catch (e) {
                 console.warn('Erro ao carregar participantes', e);
             }
@@ -3252,7 +3480,7 @@ class RPGCompanionWebServer:
             const player = document.getElementById('player-select').value;
 
             if (!player) {
-                alert('Selecione primeiro o seu personagem no topo!');
+                showPlayerAlert('⚠️ Selecione o seu personagem acima antes de gravar!');
                 return;
             }
 
@@ -3380,7 +3608,7 @@ class RPGCompanionWebServer:
             const player = document.getElementById('player-select').value;
 
             if (!player) {
-                alert('Selecione seu personagem antes de ativar o microfone satélite!');
+                showPlayerAlert('⚠️ Selecione o seu personagem acima antes de ativar o microfone satélite!');
                 return;
             }
 

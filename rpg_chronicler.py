@@ -1750,6 +1750,7 @@ class RPGChroniclerApp:
         self.companion_server.voice_train_callback = self._on_companion_voice_train
         self.companion_server.satellite_chunk_callback = self._on_companion_satellite_chunk
         self.companion_server.get_participants_callback = self._on_companion_get_participants
+        self.companion_server.add_participant_callback = self._on_companion_add_participant
         # Estado de satélite desta sessão: {player_label: [chunk_path, ...]}
         self._satellite_session: dict = {}
         self._satellite_session_start_utc: float = 0.0
@@ -3652,31 +3653,120 @@ class RPGChroniclerApp:
 
     def _on_companion_get_participants(self) -> list:
         """Retorna a lista de participantes configurados na sessão atual."""
+        raw = []
         try:
-            raw = self.options_cfg.get("participants", []) if hasattr(self, "options_cfg") else []
-            if not raw and hasattr(self, "txt_participantes"):
-                raw_text = self.txt_participantes.get("1.0", "end").strip()
-                raw = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+            if hasattr(self, "config") and isinstance(self.config, dict):
+                raw = self.config.get("participantes", [])
+            if not raw and CONFIG_FILE.exists():
+                with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+                    cfg_disk = json.load(f)
+                    raw = cfg_disk.get("participantes", [])
         except Exception:
             raw = []
+
         result = []
         for entry in raw:
             if isinstance(entry, dict):
-                result.append(entry)
+                nome = entry.get("nome", "").strip()
+                personagem = entry.get("personagem", "").strip()
+                papel = entry.get("papel", "Jogador").strip()
+                lbl = format_participant_voice_label(entry)
+                disp = f"{personagem} ({nome})" if papel != "Mestre da Mesa" else f"👑 Mestre {nome} ({personagem})"
+                result.append({
+                    "label": lbl,
+                    "display_name": disp,
+                    "nome": nome,
+                    "personagem": personagem,
+                    "papel": papel
+                })
             else:
-                result.append({"label": str(entry), "name": str(entry)})
+                result.append({"label": str(entry), "display_name": str(entry), "name": str(entry)})
+
+        if not result:
+            try:
+                profiles = load_voice_profiles()
+                for key in profiles.keys():
+                    result.append({"label": key, "display_name": key, "name": key})
+            except Exception:
+                pass
         return result
+
+    def _on_companion_add_participant(self, nome: str, personagem: str, papel: str = "Jogador") -> dict:
+        """Adiciona um participante recebido via Companion Web diretamente na sessão."""
+        try:
+            novo = {"nome": nome, "personagem": personagem, "papel": papel}
+            exists = False
+            for p in self.config.get("participantes", []):
+                if (p.get("nome", "").strip().lower() == nome.strip().lower() and
+                    p.get("personagem", "").strip().lower() == personagem.strip().lower()):
+                    exists = True
+                    novo = p
+                    break
+            if not exists:
+                self.config.setdefault("participantes", []).append(novo)
+                if hasattr(self, "populate_participantes_tree"):
+                    self.root.after(0, self.populate_participantes_tree)
+                self.save_config()
+                LOGGER.info("Companion cadastrou participante: %s (%s)", personagem, nome)
+
+            label = format_participant_voice_label(novo)
+            disp = f"{novo['personagem']} ({novo['nome']})" if novo.get("papel") != "Mestre da Mesa" else f"👑 Mestre {novo['nome']} ({novo['personagem']})"
+            return {
+                "status": "ok",
+                "ok": True,
+                "participant": {
+                    "label": label,
+                    "display_name": disp,
+                    "nome": novo["nome"],
+                    "personagem": novo["personagem"],
+                    "papel": novo["papel"]
+                }
+            }
+        except Exception as exc:
+            LOGGER.exception("Erro ao adicionar participante via Companion: %s", exc)
+            return {"status": "error", "ok": False, "message": str(exc)}
 
     def _on_companion_voice_train(self, player_label: str, wav_path: str) -> dict:
         """Recebe áudio de treino de voz enviado pelo Companion e atualiza o perfil."""
+        actual_wav = wav_path
+        temp_converted = None
         try:
-            trained = train_voice_profile_from_audio(player_label, wav_path)
+            # Se for WebM ou formato não WAV, converte via FFmpeg para compatibilidade com wavfile.read
+            with open(wav_path, "rb") as f:
+                header = f.read(4)
+            if header != b"RIFF":
+                ffmpeg_bin = shutil.which("ffmpeg")
+                if ffmpeg_bin:
+                    temp_converted = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    temp_converted.close()
+                    proc = subprocess.run(
+                        [ffmpeg_bin, "-nostdin", "-v", "error", "-y", "-i", wav_path, "-ac", "1", "-ar", "16000", temp_converted.name],
+                        capture_output=True,
+                        timeout=20,
+                    )
+                    if proc.returncode == 0 and os.path.exists(temp_converted.name):
+                        actual_wav = temp_converted.name
+
+            trained = train_voice_profile_from_audio(player_label, actual_wav)
             LOGGER.info("Companion voice-train: perfil '%s' atualizado.", player_label)
-            self.root.after(0, self.update_bank_status_label)
-            return {"ok": True, "player": player_label, "trained": trained}
+            if hasattr(self, "root") and hasattr(self, "update_bank_status_label"):
+                self.root.after(0, self.update_bank_status_label)
+            return {
+                "ok": True,
+                "status": "ok",
+                "player": player_label,
+                "trained": trained,
+                "message": f"Perfil '{player_label}' treinado com sucesso!"
+            }
         except Exception as exc:
             LOGGER.warning("Companion voice-train erro para '%s': %s", player_label, exc)
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "status": "error", "error": str(exc), "message": str(exc)}
+        finally:
+            if temp_converted and os.path.exists(temp_converted.name):
+                try:
+                    os.unlink(temp_converted.name)
+                except Exception:
+                    pass
 
     def _on_companion_satellite_chunk(
         self,
@@ -3700,7 +3790,9 @@ class RPGChroniclerApp:
                 hasattr(self, "recorder") and hasattr(self.recorder, "output_path") and self.recorder.output_path
             ) else Path(tempfile.gettempdir())
 
-            sat_dir = session_dir / "session_satellites" / player_label
+            # Sanitiza o nome do diretório para evitar erros com '/' no Windows
+            safe_player = re.sub(r'[\\/*?:"<>|]', "_", player_label).strip() or "jogador"
+            sat_dir = session_dir / "session_satellites" / safe_player
             sat_dir.mkdir(parents=True, exist_ok=True)
 
             # Registra o timestamp de início da sessão (primeiro chunk recebido)
@@ -3708,9 +3800,25 @@ class RPGChroniclerApp:
                 self._satellite_session_start_utc = timestamp_utc
                 LOGGER.info("Satélite: primeiro chunk de '%s' em t=%.3f", player_label, timestamp_utc)
 
+            # Se o áudio recebido for WebM (MediaRecorder do browser), converte para WAV via FFmpeg
+            wav_bytes = audio_bytes
+            if not audio_bytes.startswith(b"RIFF"):
+                ffmpeg_bin = shutil.which("ffmpeg")
+                if ffmpeg_bin:
+                    try:
+                        proc = subprocess.run(
+                            [ffmpeg_bin, "-nostdin", "-v", "error", "-y", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"],
+                            input=audio_bytes,
+                            capture_output=True,
+                            timeout=10,
+                        )
+                        if proc.returncode == 0 and proc.stdout:
+                            wav_bytes = proc.stdout
+                    except Exception as fe:
+                        LOGGER.warning("Conversão de chunk satélite para WAV: %s", fe)
+
             chunk_filename = sat_dir / f"{chunk_index:06d}_{timestamp_utc:.3f}.wav"
-            # Salva bytes diretamente; o frontend envia WAV ou WebM — tenta salvar como WAV
-            chunk_filename.write_bytes(audio_bytes)
+            chunk_filename.write_bytes(wav_bytes)
 
             # Mantém registro em memória para acesso rápido durante o pós-processamento
             self._satellite_session.setdefault(player_label, [])
@@ -3718,10 +3826,16 @@ class RPGChroniclerApp:
             if chunk_path_str not in self._satellite_session[player_label]:
                 self._satellite_session[player_label].append(chunk_path_str)
 
-            return {"ok": True, "player": player_label, "chunk": chunk_index, "saved": str(chunk_filename)}
+            return {
+                "ok": True,
+                "status": "ok",
+                "player": player_label,
+                "chunk": chunk_index,
+                "saved": str(chunk_filename)
+            }
         except Exception as exc:
             LOGGER.warning("Satellite chunk erro para '%s' chunk %d: %s", player_label, chunk_index, exc)
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "status": "error", "error": str(exc), "message": str(exc)}
 
 
     def toggle_companion_server(self):
@@ -4135,8 +4249,9 @@ class RPGChroniclerApp:
                     session_start = getattr(self, "_satellite_session_start_utc", 0.0)
                     satellite_wavs: dict = {}
                     for player_lbl, _chunks in sat_session.items():
-                        chunks_folder = session_dir / "session_satellites" / player_lbl
-                        out_wav = session_dir / "session_satellites" / f"{player_lbl}_assembled.wav"
+                        safe_player = re.sub(r'[\\/*?:"<>|]', "_", player_lbl).strip() or "jogador"
+                        chunks_folder = session_dir / "session_satellites" / safe_player
+                        out_wav = session_dir / "session_satellites" / f"{safe_player}_assembled.wav"
                         ok = assemble_satellite_wav(
                             str(chunks_folder), str(out_wav),
                             session_start_utc=session_start,

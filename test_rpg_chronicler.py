@@ -1344,10 +1344,96 @@ class RPGChroniclerTests(unittest.TestCase):
         self.assertEqual(highlight_received[0][0], "epic")
         self.assertEqual(highlight_received[0][1], "Guerreiro derrubou o chefe")
 
+        # Teste 4: GET /api/participants
+        participants_data = [
+            {"label": "[Lorenzo (Raphael)]", "display_name": "Lorenzo (Raphael)", "nome": "Raphael", "personagem": "Lorenzo", "papel": "Jogador"},
+            {"label": "[Mestre Christian - Narração de Cenários/NPCs]", "display_name": "👑 Mestre Christian (Narrador)", "nome": "Christian", "personagem": "Narrador", "papel": "Mestre da Mesa"}
+        ]
+        server.get_participants_callback = lambda: participants_data
+        req_parts = urllib.request.Request("http://127.0.0.1:8991/api/participants")
+        with urllib.request.urlopen(req_parts, timeout=3.0) as resp_parts:
+            self.assertEqual(resp_parts.status, 200)
+            pdata = json.loads(resp_parts.read().decode("utf-8"))
+            self.assertIn("participants", pdata)
+            self.assertEqual(len(pdata["participants"]), 2)
+            self.assertEqual(pdata["participants"][0]["label"], "[Lorenzo (Raphael)]")
+
+        # Teste 5: POST /api/participants/add
+        add_received = []
+        def _on_add(nome, pers, papel):
+            add_received.append((nome, pers, papel))
+            return {
+                "status": "ok",
+                "ok": True,
+                "participant": {
+                    "label": f"[{pers} ({nome})]",
+                    "display_name": f"{pers} ({nome})",
+                    "nome": nome,
+                    "personagem": pers,
+                    "papel": papel
+                }
+            }
+        server.add_participant_callback = _on_add
+        add_payload = json.dumps({"nome": "Fernando", "personagem": "Pistoleiro", "papel": "Jogador"}).encode("utf-8")
+        req_add = urllib.request.Request("http://127.0.0.1:8991/api/participants/add", data=add_payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req_add, timeout=3.0) as resp_add:
+            self.assertEqual(resp_add.status, 200)
+            res_json = json.loads(resp_add.read().decode("utf-8"))
+            self.assertEqual(res_json.get("status"), "ok")
+            self.assertEqual(res_json["participant"]["label"], "[Pistoleiro (Fernando)]")
+        self.assertEqual(len(add_received), 1)
+        self.assertEqual(add_received[0], ("Fernando", "Pistoleiro", "Jogador"))
+
+        # Teste 6: POST /api/voice/train com retorno {"ok": True}
+        server.voice_train_callback = lambda lbl, path: {"ok": True, "status": "ok", "player": lbl}
+        import base64
+        dummy_audio = base64.b64encode(b"RIFFdummywave").decode("ascii")
+        train_payload = json.dumps({"player_label": "[Lorenzo (Raphael)]", "audio_b64": dummy_audio}).encode("utf-8")
+        req_train = urllib.request.Request("http://127.0.0.1:8991/api/voice/train", data=train_payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req_train, timeout=3.0) as resp_train:
+            self.assertEqual(resp_train.status, 200)
+            train_json = json.loads(resp_train.read().decode("utf-8"))
+            self.assertEqual(train_json.get("status"), "ok")
+
+        # Teste 7: POST /api/satellite/chunk com retorno {"ok": True}
+        server.satellite_chunk_callback = lambda lbl, cid, idx, ts, data: {"ok": True, "status": "ok", "player": lbl}
+        sat_payload = json.dumps({"player_label": "[Lorenzo (Raphael)]", "chunk_index": 1, "timestamp": 123.456, "audio_b64": dummy_audio}).encode("utf-8")
+        req_sat = urllib.request.Request("http://127.0.0.1:8991/api/satellite/chunk", data=sat_payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req_sat, timeout=3.0) as resp_sat:
+            self.assertEqual(resp_sat.status, 200)
+            sat_json = json.loads(resp_sat.read().decode("utf-8"))
+            self.assertEqual(sat_json.get("status"), "ok")
 
         # Finaliza servidor
         server.stop()
         self.assertFalse(server.is_running())
+
+    def test_rpg_chronicler_companion_participant_callbacks(self):
+        """Testa _on_companion_get_participants e _on_companion_add_participant do RPGChroniclerApp."""
+        app = mock.MagicMock()
+        app.config = {
+            "participantes": [
+                {"nome": "Raphael", "personagem": "Lorenzo", "papel": "Jogador"},
+                {"nome": "Christian", "personagem": "Narrador", "papel": "Mestre da Mesa"}
+            ]
+        }
+        # Testa _on_companion_get_participants
+        parts = app_module.RPGChroniclerApp._on_companion_get_participants(app)
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0]["label"], "[Lorenzo (Raphael)]")
+        self.assertEqual(parts[0]["display_name"], "Lorenzo (Raphael)")
+        self.assertEqual(parts[1]["label"], "[Mestre Christian - Narração de Cenários/NPCs]")
+        self.assertIn("👑", parts[1]["display_name"])
+
+        # Testa _on_companion_add_participant
+        app.save_config = mock.MagicMock()
+        app.populate_participantes_tree = mock.MagicMock()
+        app.root = mock.MagicMock()
+        res = app_module.RPGChroniclerApp._on_companion_add_participant(app, "Fernando", "Pistoleiro", "Jogador")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["participant"]["label"], "[Pistoleiro (Fernando)]")
+        self.assertEqual(len(app.config["participantes"]), 3)
+        app.save_config.assert_called_once()
 
 
 class TestSatelliteFusion(unittest.TestCase):
