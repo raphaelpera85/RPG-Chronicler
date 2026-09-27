@@ -9,6 +9,7 @@ description = "Gravador, transcritor, diarizador e cronista de sessões de RPG"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=46,<51",
   "faster-whisper>=1.2,<2",
   "numpy>=2,<3",
   "openai>=2,<4",

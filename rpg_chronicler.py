@@ -1745,7 +1745,7 @@ class RPGChroniclerApp:
 
         self.setup_ui_styles()
         self.highlight_manager = TimelineHighlightManager()
-        self.companion_server = RPGCompanionWebServer()
+        self.companion_server = RPGCompanionWebServer(use_https=True)
         self.companion_server.highlight_callback = self._on_companion_remote_highlight
         self.companion_server.voice_train_callback = self._on_companion_voice_train
         self.companion_server.satellite_chunk_callback = self._on_companion_satellite_chunk
@@ -3742,6 +3742,7 @@ class RPGChroniclerApp:
                     proc = subprocess.run(
                         [ffmpeg_bin, "-nostdin", "-v", "error", "-y", "-i", wav_path, "-ac", "1", "-ar", "16000", temp_converted.name],
                         capture_output=True,
+                        stdin=subprocess.DEVNULL,
                         timeout=20,
                     )
                     if proc.returncode == 0 and os.path.exists(temp_converted.name):
@@ -3848,16 +3849,21 @@ class RPGChroniclerApp:
         else:
             success = self.companion_server.start()
             if success:
-                ip = self.companion_server.get_local_ip()
-                port = self.companion_server.port
-                url = f"http://{ip}:{port}"
+                url = self.companion_server.get_url()
+                setup_url = self.companion_server.get_setup_url()
                 if hasattr(self, "btn_companion_toggle"):
                     self.btn_companion_toggle.config(text="🛑 Parar Companion", bg=self.colors["crimson"])
                 if hasattr(self, "lbl_last_highlight"):
                     self.lbl_last_highlight.config(text=f"Companion: {url}", fg=self.colors["emerald"])
-                messagebox.showinfo("Companion Ativo", f"Painel de Jogadores iniciado com sucesso!\n\nDispositivos na mesma rede Wi-Fi podem acessar:\n{url}")
+                messagebox.showinfo("Companion Ativo", f"Painel de Jogadores iniciado com HTTPS!\n\n"
+                    f"Primeiro acesso no celular (guia e certificado):\n{setup_url}\n\n"
+                    f"Após configurar o certificado, abra:\n{url}\n\n"
+                    "Use a mesma rede Wi-Fi. Toque no botão de gravação para pedir permissão.\n\n"
+                    f"Compare com o SHA-256 nos detalhes do certificado baixado:\n{self.companion_server.certificate_fingerprint()}\n\n"
+                    f"Alternativa: transfira por USB o arquivo\n{self.companion_server.cert_dir / 'companion_ca.cer'}")
             else:
-                messagebox.showerror("Erro no Servidor", "Não foi possível iniciar o servidor local na porta 8080.")
+                messagebox.showerror("Erro no Servidor", "Não foi possível iniciar o Companion HTTPS.\n\n"
+                    f"{self.companion_server.last_error}\n\nVerifique se as portas 8080 e 8081 estão disponíveis.")
 
     def export_obsidian_vault_ui(self):
         dest_dir = filedialog.askdirectory(title="Selecione a Pasta para o Vault do Obsidian")

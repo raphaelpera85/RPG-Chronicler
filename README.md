@@ -66,6 +66,37 @@ A chave não é persistida por versões novas do aplicativo. Consulte [SECURITY.
 
 Para uma sessão real, carregue a gravação, defina a quantidade de vozes esperada e deixe **Aprender/reforçar perfis de voz a partir da gravação da sessão** ligado. O Chronicler agrupa a sessão nesse número de vozes, extrai amostras, compara com `perfis_vozes.json` e atualiza o banco quando houver confirmação humana ou reconhecimento acústico confiante. Se o grupo tiver vozes novas, mantenha a confirmação interativa ligada na primeira sessão para nomear cada voz corretamente.
 
+### Companion Celular: microfone pela rede Wi-Fi
+
+O botão **Companion Celular** inicia o painel em HTTPS na porta 8080 e um guia
+de configuração em HTTP na porta 8081. O HTTP do guia só fornece instruções e
+o certificado público; não disponibiliza dados ou APIs da sessão.
+
+1. Reinicie o aplicativo após atualizar e clique em **Companion Celular**.
+2. No celular, na mesma rede Wi-Fi, abra o endereço do **primeiro acesso** mostrado no computador.
+3. Baixe `companion_ca.cer` e confira o SHA-256 **nos detalhes do certificado baixado** com o
+   exibido no computador. Comparar só o texto da página HTTP não verifica o arquivo.
+   Se o aparelho não mostrar o SHA-256, transfira o certificado do computador por USB.
+4. **Android:** procure “Instalar certificado” nas configurações e instale como **Certificado de CA**.
+   **iPhone/iPad:** use Safari, instale o perfil em Ajustes → Geral → VPN e Gerenciamento de Dispositivo;
+   depois ative a confiança em Geral → Sobre → Ajustes de Confiança de Certificado.
+5. Abra o link HTTPS do guia, sem aviso de certificado, selecione seu personagem e toque
+   em **Ativar Microfone Satélite** ou no botão de gravação de treino. Permita o microfone.
+
+A confiança no certificado é uma configuração manual por aparelho. Aceitar um aviso de
+certificado ou trocar apenas `http` por `https` não substitui essa configuração.
+Use Chrome/Safari diretamente, fora de aplicativos de mensagens. Se a permissão já foi
+negada, revise as permissões do site e do navegador no sistema do celular.
+
+O certificado e as chaves ficam em `~/.rpg_chronicler/ssl`, fora do projeto. Nunca compartilhe
+os arquivos de chave privada. O certificado de servidor é renovado quando o IP muda,
+preservando a CA que o celular já conhece. Confie apenas na CA do seu computador;
+remova-a das configurações de certificados/perfis quando não precisar mais.
+O servidor continua restrito ao uso em rede local confiável, sem autenticação de jogadores.
+
+Referências: [Android](https://support.google.com/pixelphone/answer/2844832?hl=pt-BR),
+[Apple](https://support.apple.com/pt-br/102390).
+
 ## Checkpoints
 
 Cada execução pode conter:

@@ -221,7 +221,7 @@ def probe_audio(path: Path | str) -> AudioMetadata:
     ]
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, check=True, timeout=30
+            command, capture_output=True, text=True, check=True, timeout=30, stdin=subprocess.DEVNULL
         )
     except FileNotFoundError as exc:
         raise RuntimeError("FFprobe não está instalado ou não está no PATH.") from exc
@@ -264,6 +264,7 @@ def prepare_audio(path: Path | str, sample_rate: int = 16000) -> PreparedAudio:
     converted = temporary_directory / f"{source.stem}-mono-{sample_rate}.wav"
     command = [
         "ffmpeg",
+        "-nostdin",
         "-v",
         "error",
         "-y",
@@ -279,7 +280,7 @@ def prepare_audio(path: Path | str, sample_rate: int = 16000) -> PreparedAudio:
         str(converted),
     ]
     try:
-        subprocess.run(command, capture_output=True, text=True, check=True, timeout=600)
+        subprocess.run(command, capture_output=True, text=True, check=True, timeout=600, stdin=subprocess.DEVNULL)
         converted_metadata = probe_audio(converted)
     except FileNotFoundError as exc:
         shutil.rmtree(temporary_directory, ignore_errors=True)
@@ -2362,7 +2363,7 @@ def compress_audio_archive(
 
     orig_size = src.stat().st_size
 
-    cmd = [ffmpeg_bin, "-y", "-i", str(src)]
+    cmd = [ffmpeg_bin, "-nostdin", "-y", "-i", str(src)]
     if target_format == "flac":
         cmd.extend(["-c:a", "flac", "-compression_level", "8"])
     elif target_format == "opus":
@@ -2372,7 +2373,8 @@ def compress_audio_archive(
 
     cmd.append(str(dst))
 
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         check=False, stdin=subprocess.DEVNULL)
     if res.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
         raise RuntimeError(f"Falha na compressão FFmpeg ({res.returncode}): {res.stderr[-300:] if res.stderr else ''}")
 
@@ -2678,8 +2680,8 @@ $synth.Dispose()
 # 5. PAINEL COMPANION WEB LOCAL WI-FI (HTTP.SERVER ZERO-DEPENDENCY)
 # =====================================================================
 
-def ensure_companion_ssl_cert(cert_dir: Path | str | None = None) -> tuple[str, str]:
-    """Gera um certificado SSL autoassinado local para liberar Web Audio / getUserMedia em celulares na LAN."""
+def ensure_companion_ssl_cert(cert_dir: Path | str | None = None, local_ip: str = "127.0.0.1") -> tuple[str, str]:
+    """Emite TLS para a LAN; o celular deve confiar na CA pública companion_ca.cer."""
     if cert_dir is None:
         cert_dir = Path.home() / ".rpg_chronicler" / "ssl"
     else:
@@ -2687,39 +2689,81 @@ def ensure_companion_ssl_cert(cert_dir: Path | str | None = None) -> tuple[str, 
     cert_dir.mkdir(parents=True, exist_ok=True)
     cert_file = cert_dir / "companion_cert.pem"
     key_file = cert_dir / "companion_key.pem"
-    if cert_file.exists() and key_file.exists():
-        return str(cert_file), str(key_file)
-
     try:
+        import ipaddress
         from cryptography import x509
-        from cryptography.x509.oid import NameOID
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.hazmat.primitives import serialization
         import datetime
 
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        subject = issuer = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, "RPG Chronicler Companion"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "RPG Chronicler"),
-        ])
         now = datetime.datetime.now(datetime.timezone.utc)
+        ca_file = cert_dir / "companion_ca.pem"
+        ca_key_file = cert_dir / "companion_ca_key.pem"
+        if ca_file.exists() != ca_key_file.exists():
+            raise ValueError("CA local incompleta. Restaure o certificado e sua chave do backup.")
+        if ca_file.exists():
+            ca = x509.load_pem_x509_certificate(ca_file.read_bytes())
+            ca_key = serialization.load_pem_private_key(ca_key_file.read_bytes(), password=None)
+            if ca.public_key().public_numbers() != ca_key.public_key().public_numbers():
+                raise ValueError("A chave da CA local não corresponde ao certificado.")
+            if not ca.not_valid_before_utc <= now < ca.not_valid_after_utc:
+                raise ValueError("CA local expirada ou relógio incorreto. Renove a CA e configure os celulares novamente.")
+        else:
+            ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "RPG Chronicler Companion Local CA")])
+            ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+                  .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+                  .not_valid_before(now - datetime.timedelta(days=1))
+                  .not_valid_after(now + datetime.timedelta(days=3650))
+                  .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                  .add_extension(x509.KeyUsage(False, False, False, False, False, True, True, None, None), critical=True)
+                  .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+                  .sign(ca_key, hashes.SHA256()))
+            ca_key_file.write_bytes(ca_key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            ca_file.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+        # Somente este certificado público é disponibilizado ao telefone.
+        (cert_dir / "companion_ca.cer").write_bytes(ca.public_bytes(serialization.Encoding.DER))
+        ips = {ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address(local_ip)}
+        if cert_file.exists() and key_file.exists():
+            try:
+                existing = x509.load_pem_x509_certificate(cert_file.read_bytes())
+                existing.verify_directly_issued_by(ca)
+                old_key = serialization.load_pem_private_key(key_file.read_bytes(), password=None)
+                names = existing.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+                if (ips.issubset(set(names.get_values_for_type(x509.IPAddress)))
+                        and "localhost" in names.get_values_for_type(x509.DNSName)
+                        and existing.not_valid_before_utc <= now
+                        and existing.not_valid_after_utc > now + datetime.timedelta(days=1)
+                        and existing.public_key().public_numbers() == old_key.public_key().public_numbers()):
+                    return str(cert_file), str(key_file)
+            except (ValueError, TypeError, InvalidSignature, x509.ExtensionNotFound):
+                pass  # Certificado antigo: emite outro sem trocar a CA confiada pelos celulares.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "RPG Chronicler Companion")])
         cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
-            .issuer_name(issuer)
+            .issuer_name(ca.subject)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=730))
+            .not_valid_after(min(now + datetime.timedelta(days=365), ca.not_valid_after_utc))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.KeyUsage(True, False, True, False, False, False, False, None, None), critical=True)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
             .add_extension(
                 x509.SubjectAlternativeName([
                     x509.DNSName("localhost"),
-                    x509.IPAddress(socket.inet_aton("127.0.0.1")),
+                    *[x509.IPAddress(ip) for ip in sorted(ips, key=str)],
                 ]),
                 critical=False,
             )
-            .sign(key, hashes.SHA256())
+            .sign(ca_key, hashes.SHA256())
         )
         cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
         key_file.write_bytes(key.private_bytes(
@@ -2732,10 +2776,45 @@ def ensure_companion_ssl_cert(cert_dir: Path | str | None = None) -> tuple[str, 
         raise RuntimeError(f"Não foi possível gerar certificado SSL local: {exc}")
 
 
+class RPGCompanionSetupHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP de configuração: nunca expõe APIs da sessão ou chaves privadas."""
+
+    server_ref: Any = None
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/companion_ca.cer":
+            body = (self.server_ref.cert_dir / "companion_ca.cer").read_bytes()
+            content_type = "application/pkix-cert"
+        elif path == "/":
+            body = self.server_ref.render_setup_html().encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if path.endswith(".cer"):
+            self.send_header("Content-Disposition", 'attachment; filename="companion_ca.cer"')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
 class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
     """Handler HTTP para o painel companion local via Wi-Fi."""
 
     server_ref: Any = None
+    MAX_AUDIO_BYTES = 8 * 1024 * 1024
+
+    def setup(self):
+        # O handshake ocorre na thread da conexão, nunca bloqueando serve_forever/stop.
+        self.request.settimeout(15)
+        super().setup()
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -2772,7 +2851,14 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_error(400, "Content-Length inválido")
+            return
+        if content_length < 0 or content_length > self.MAX_AUDIO_BYTES * 2:
+            self.send_error(413, "Payload muito grande")
+            return
         body = self.rfile.read(content_length).decode("utf-8", errors="replace") if content_length > 0 else "{}"
         try:
             payload = json.loads(body)
@@ -2837,10 +2923,17 @@ class RPGCompanionHTTPHandler(http.server.BaseHTTPRequestHandler):
 class RPGCompanionWebServer:
     """Servidor web local leve (sem frameworks externos) para jogadores acompanharem a sessão no celular."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_https: bool = False):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080, use_https: bool = False,
+                 cert_dir: Path | str | None = None, setup_port: int = 8081):
         self.host = host
         self.port = port
         self.use_https = use_https
+        self.cert_dir = Path(cert_dir) if cert_dir is not None else Path.home() / ".rpg_chronicler" / "ssl"
+        self.setup_port = setup_port
+        self.setup_server = None
+        self.setup_thread = None
+        self.last_error = ""
+        self.local_ip = "127.0.0.1"
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
@@ -2863,23 +2956,44 @@ class RPGCompanionWebServer:
             return True
         if use_https is not None:
             self.use_https = use_https
+        self.last_error = ""
         try:
-            handler_class = RPGCompanionHTTPHandler
-            handler_class.server_ref = self
+            self.local_ip = self.get_local_ip() if self.host == "0.0.0.0" else self.host
+            handler_class = type("CompanionHandler", (RPGCompanionHTTPHandler,), {"server_ref": self})
             self.server = http.server.ThreadingHTTPServer((self.host, self.port), handler_class)
+            self.port = self.server.server_address[1]
             if self.use_https:
-                cert_file, key_file = ensure_companion_ssl_cert()
+                cert_file, key_file = ensure_companion_ssl_cert(self.cert_dir, self.local_ip)
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-                self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+                self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True,
+                                                     do_handshake_on_connect=False)
+                setup_handler = type("CompanionSetupHandler", (RPGCompanionSetupHandler,), {"server_ref": self})
+                self.setup_server = http.server.ThreadingHTTPServer((self.host, self.setup_port), setup_handler)
+                self.setup_port = self.setup_server.server_address[1]
+                self.setup_thread = threading.Thread(target=self.setup_server.serve_forever, daemon=True)
+                self.setup_thread.start()
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
             return True
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)
+            if self.setup_server:
+                if self.setup_thread and self.setup_thread.is_alive():
+                    self.setup_server.shutdown()
+                self.setup_server.server_close()
+            if self.server:
+                self.server.server_close()
             self.server = None
+            self.setup_server = None
+            self.thread = self.setup_thread = None
             return False
 
     def stop(self):
+        if self.setup_server:
+            self.setup_server.shutdown()
+            self.setup_server.server_close()
+            self.setup_server = self.setup_thread = None
         if self.server:
             try:
                 self.server.shutdown()
@@ -2888,6 +3002,43 @@ class RPGCompanionWebServer:
                 pass
             self.server = None
             self.thread = None
+
+    def get_url(self) -> str:
+        return f"{'https' if self.use_https else 'http'}://{self.local_ip}:{self.port}"
+
+    def get_setup_url(self) -> str:
+        return f"http://{self.local_ip}:{self.setup_port}"
+
+    def certificate_fingerprint(self) -> str:
+        import hashlib
+        return hashlib.sha256((self.cert_dir / "companion_ca.cer").read_bytes()).hexdigest().upper()
+
+    def render_setup_html(self) -> str:
+        url = html.escape(self.get_url(), quote=True)
+        fingerprint = self.certificate_fingerprint()
+        return f'''<!doctype html><html lang="pt-BR"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configurar microfone — Companion</title>
+<body style="font:18px system-ui;max-width:720px;margin:24px auto;padding:16px">
+<h1>Microfone do celular</h1>
+<p>Configure uma vez neste celular. Use a mesma rede Wi-Fi do computador.</p>
+<ol><li><a href="/companion_ca.cer">Baixar certificado local do Companion</a>.
+Antes de confiar, abra os detalhes do certificado baixado no celular e compare seu SHA-256
+com o exibido no computador. Comparar apenas o texto desta página não verifica o arquivo.
+Se o celular não mostrar a impressão, transfira companion_ca.cer do computador por USB.</li>
+<li><strong>Android:</strong> em Configurações, procure “Instalar certificado” → Certificado de CA
+e selecione companion_ca.cer. Os nomes variam conforme o fabricante.</li>
+<li><strong>iPhone/iPad:</strong> abra esta página no Safari, baixe o certificado e instale o perfil
+em Ajustes → Geral → VPN e Gerenciamento de Dispositivo. Depois vá a Geral → Sobre →
+Ajustes de Confiança de Certificado e ative a confiança para RPG Chronicler Companion Local CA.</li>
+<li><a href="{url}">Abrir Companion com HTTPS</a>. A página deve abrir sem aviso de certificado.
+Escolha seu personagem, toque em Ativar Microfone Satélite ou Gravar Treino e permita o microfone.</li></ol>
+<p>Abra no Chrome ou Safari, fora do navegador interno de aplicativos de mensagens.
+Se a permissão já foi negada, reative o microfone nas configurações do site e do navegador no celular.</p>
+<p>Este certificado torna esta CA local confiável no aparelho. Instale somente o certificado do seu
+computador e remova-o das configurações de certificados/perfis quando não precisar mais.</p>
+<p>SHA-256: <code style="overflow-wrap:anywhere">{fingerprint}</code></p>
+</body></html>'''
 
     def is_running(self) -> bool:
         return self.server is not None
@@ -3001,10 +3152,12 @@ class RPGCompanionWebServer:
         if "," in audio_b64:
             audio_b64 = audio_b64.split(",", 1)[1]
         try:
-            audio_bytes = base64.b64decode(audio_b64)
+            audio_bytes = base64.b64decode(audio_b64, validate=True)
         except Exception as exc:
             return {"status": "error", "message": f"Falha ao decodificar áudio: {exc}"}
 
+        if not audio_bytes or len(audio_bytes) > RPGCompanionHTTPHandler.MAX_AUDIO_BYTES:
+            return {"status": "error", "message": "Amostra de áudio vazia ou maior que 8 MB."}
         filename = payload.get("filename") or "training.webm"
         suffix = Path(filename).suffix or ".webm"
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -3027,8 +3180,11 @@ class RPGCompanionWebServer:
     def on_remote_satellite_chunk(self, payload: dict) -> dict:
         player_label = (payload.get("player_label") or "").strip()
         audio_b64 = payload.get("audio_b64") or ""
-        chunk_index = int(payload.get("chunk_index", 0))
-        timestamp = float(payload.get("timestamp", 0.0))
+        try:
+            chunk_index = int(payload.get("chunk_index", 0))
+            timestamp = float(payload.get("timestamp", 0.0))
+        except (TypeError, ValueError):
+            return {"status": "error", "message": "Índice ou timestamp de chunk inválido."}
         client_id = str(payload.get("client_id", "unknown"))
 
         if not audio_b64:
@@ -3036,10 +3192,12 @@ class RPGCompanionWebServer:
         if "," in audio_b64:
             audio_b64 = audio_b64.split(",", 1)[1]
         try:
-            audio_bytes = base64.b64decode(audio_b64)
+            audio_bytes = base64.b64decode(audio_b64, validate=True)
         except Exception as exc:
             return {"status": "error", "message": f"Erro de base64: {exc}"}
 
+        if not audio_bytes or len(audio_bytes) > RPGCompanionHTTPHandler.MAX_AUDIO_BYTES:
+            return {"status": "error", "message": "Chunk vazio ou maior que 8 MB."}
         if callable(self.satellite_chunk_callback):
             res = self.satellite_chunk_callback(player_label, client_id, chunk_index, timestamp, audio_bytes)
             return res if isinstance(res, dict) else {"status": "ok"}
@@ -3341,6 +3499,41 @@ class RPGCompanionWebServer:
     </div>
 
     <script>
+        function microphoneAccessProblem() {
+            if (!window.isSecureContext) {
+                return 'Esta conexão não é segura: o navegador bloqueia o microfone antes de pedir permissão. Abra o guia indicado no computador, instale o certificado local e entre pelo endereço HTTPS sem aviso de certificado.';
+            }
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                return 'Este navegador não oferece acesso ao microfone. Abra o endereço no Chrome ou Safari, fora de aplicativos de mensagens.';
+            }
+            if (typeof MediaRecorder === 'undefined') {
+                return 'Este navegador não suporta gravação de áudio. Atualize o Chrome ou Safari.';
+            }
+            return '';
+        }
+
+        async function requestMicrophone() {
+            const problem = microphoneAccessProblem();
+            if (problem) throw new Error(problem);
+            try {
+                return await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                const messages = {
+                    NotAllowedError: 'O microfone foi bloqueado pelo navegador ou sistema. Nas configurações do site e do celular, permita o microfone para este navegador e tente novamente.',
+                    NotFoundError: 'Nenhum microfone foi encontrado neste aparelho.',
+                    NotReadableError: 'Não foi possível abrir o microfone. Feche outros aplicativos que estejam usando áudio e tente novamente.',
+                    SecurityError: 'O navegador desativou a captura. Abra o Companion com HTTPS confiável no Chrome ou Safari.'
+                };
+                throw new Error(messages[err.name] || ('Falha ao acessar microfone: ' + (err.message || err.name)));
+            }
+        }
+
+        function recorderOptions() {
+            const candidates = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
+            const mimeType = candidates.find(type => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(type));
+            return mimeType ? { mimeType } : {};
+        }
+
         let currentPhrase = 1;
         const PHRASES = {
             1: "Eu saco a minha arma e avanço com cautela pelas sombras do calabouço. Vejo uma porta de ferro enferrujada entreaberta e aviso o grupo em voz baixa: preparem suas tochas e fiquem atentos, sinto cheiro de enxofre e passos pesados logo à frente.",
@@ -3490,11 +3683,11 @@ class RPGCompanionWebServer:
             }
 
             try {
-                trainStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                trainStream = await requestMicrophone();
             } catch (err) {
                 statusBox.style.display = 'block';
                 statusBox.className = 'alert-box alert-warn';
-                statusBox.innerText = '⚠️ O navegador bloqueou o microfone. No celular, o acesso ao microfone exige HTTPS ou permissão nas configurações do site.';
+                statusBox.innerText = '⚠️ ' + err.message;
                 return;
             }
 
@@ -3518,7 +3711,8 @@ class RPGCompanionWebServer:
             updateVu();
 
             trainChunks = [];
-            trainRecorder = new MediaRecorder(trainStream);
+            const trainOptions = recorderOptions();
+            trainRecorder = new MediaRecorder(trainStream, trainOptions);
             trainRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) trainChunks.push(e.data); };
             trainRecorder.onstop = uploadTrainAudio;
             trainRecorder.start(1000);
@@ -3555,7 +3749,7 @@ class RPGCompanionWebServer:
         async function uploadTrainAudio() {
             const statusBox = document.getElementById('train-status');
             const player = document.getElementById('player-select').value;
-            const blob = new Blob(trainChunks, { type: 'audio/webm' });
+            const blob = new Blob(trainChunks, { type: trainRecorder && trainRecorder.mimeType || 'audio/webm' });
 
             statusBox.style.display = 'block';
             statusBox.className = 'alert-box alert-success';
@@ -3621,14 +3815,14 @@ class RPGCompanionWebServer:
             }
 
             try {
-                satStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                satStream = await requestMicrophone();
                 if ('wakeLock' in navigator) {
                     try { satWakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
                 }
             } catch (err) {
                 statusBox.style.display = 'block';
                 statusBox.className = 'alert-box alert-warn';
-                statusBox.innerText = '⚠️ Não foi possível acessar o microfone. Verifique permissões ou HTTPS.';
+                statusBox.innerText = '⚠️ ' + err.message;
                 return;
             }
 
@@ -3652,7 +3846,7 @@ class RPGCompanionWebServer:
             updateSatVu();
 
             satChunkIndex = 0;
-            satRecorder = new MediaRecorder(satStream);
+            satRecorder = new MediaRecorder(satStream, recorderOptions());
             satRecorder.ondataavailable = async e => {
                 if (e.data && e.data.size > 0) {
                     sendSatelliteChunk(e.data, satChunkIndex++);
@@ -3738,4 +3932,3 @@ class RPGCompanionWebServer:
 </body>
 </html>
 """
-
